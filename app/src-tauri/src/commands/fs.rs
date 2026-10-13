@@ -2239,6 +2239,24 @@ pub async fn cmd_validate_dropped_paths(paths: Vec<String>) -> DroppedPathValida
     validate_dropped_paths(paths).await
 }
 
+/// Telegram's regular-account media caption limit is 1024 characters.
+/// Keep Unicode scalars intact and count UTF-16 units conservatively, without
+/// applying Markdown/HTML parsing to literal filenames. Encrypted uploads never
+/// use this caption path: their metadata stays inside the encrypted envelope.
+fn video_filename_caption_text(filename: &str, enabled: Option<bool>) -> String {
+    if !enabled.unwrap_or(true) {
+        return String::new();
+    }
+    let mut units = 0;
+    filename
+        .chars()
+        .take_while(|character| {
+            units += character.len_utf16();
+            units <= 1024
+        })
+        .collect()
+}
+
 #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // Tauri injects the command state parameters individually.
@@ -2250,6 +2268,7 @@ pub async fn cmd_upload_file(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
@@ -2266,6 +2285,7 @@ pub async fn cmd_upload_file(
         prompt_token,
         protect_metadata,
         video_upload_mode,
+        video_filename_caption,
         None,
         app_handle,
         state,
@@ -2289,6 +2309,7 @@ pub(crate) async fn upload_local_file(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
     sync_path: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
@@ -2314,6 +2335,7 @@ pub(crate) async fn upload_local_file(
             prompt_token,
             protect_metadata,
             video_upload_mode,
+            video_filename_caption,
             sync_path,
             app_handle,
             state,
@@ -2336,6 +2358,7 @@ async fn cmd_upload_file_owned(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
     sync_path: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
@@ -2378,6 +2401,7 @@ async fn cmd_upload_file_owned(
         prompt_token,
         protect_metadata,
         video_upload_mode,
+        video_filename_caption,
         sync_path,
         None,
         app_handle,
@@ -2406,6 +2430,7 @@ async fn cmd_upload_file_inner(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
     sync_path: Option<String>,
     admitted_upload: Option<BandwidthReservation>,
     app_handle: tauri::AppHandle,
@@ -2469,6 +2494,7 @@ async fn cmd_upload_file_inner(
     // cannot strand a bandwidth reservation.
     let video_metadata =
         prepare_video_upload_metadata(&path, &file_name, video_upload_mode).await?;
+    let video_caption = video_filename_caption_text(&file_name, video_filename_caption);
     let mut upload_reservation = match admitted_upload {
         Some(mut hold) => {
             hold.resize(size)?;
@@ -2578,7 +2604,7 @@ async fn cmd_upload_file_inner(
 
         let message = match video_metadata {
             Some(video) => InputMessage::new()
-                .text("")
+                .text(video_caption.clone())
                 .mime_type(video.mime_type)
                 .document(uploaded_file)
                 .attribute(Attribute::Video {
@@ -3047,6 +3073,7 @@ pub async fn initiate_upload(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
@@ -3064,6 +3091,7 @@ pub async fn initiate_upload(
         prompt_token,
         protect_metadata,
         video_upload_mode,
+        video_filename_caption,
         app_handle,
         state,
         bw_state,
@@ -5673,6 +5701,7 @@ pub async fn cmd_upload_from_url(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
@@ -5692,6 +5721,7 @@ pub async fn cmd_upload_from_url(
             prompt_token,
             protect_metadata,
             video_upload_mode,
+            video_filename_caption,
             app_handle,
             state,
             bw_state,
@@ -5713,6 +5743,7 @@ async fn cmd_upload_from_url_owned(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
@@ -6112,6 +6143,7 @@ async fn cmd_upload_from_url_owned(
             prompt_token,
             protect_metadata,
             video_upload_mode,
+            video_filename_caption,
             None,
             Some(upload_reservation),
             app_handle,
@@ -6141,6 +6173,7 @@ async fn cmd_upload_from_url_owned(
             })
             .unwrap_or_else(|| "remote_file".to_string())
     });
+    let video_caption = video_filename_caption_text(&file_name, video_filename_caption);
     let video_metadata = match prepare_video_upload_metadata(
         &temp_file_str,
         &file_name,
@@ -6298,7 +6331,7 @@ async fn cmd_upload_from_url_owned(
 
     let message = match video_metadata {
         Some(video) => InputMessage::new()
-            .text("")
+            .text(video_caption)
             .mime_type(video.mime_type)
             .document(uploaded_file)
             .attribute(Attribute::Video {

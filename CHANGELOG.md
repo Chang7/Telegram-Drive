@@ -1,3 +1,19 @@
+## [4.1.0] - 2026-10-13
+
+### Video uploads and settings
+
+- Add original filenames as captions for unencrypted video media uploads by default, with a saved setting to disable them. Queued uploads retain their caption choice across interruption and restart. Protected uploads keep filenames private.
+- Align desktop transfer preferences and vault settings with consistent grouped controls, readable labels, larger targets, and verified light/dark contrast.
+- Improve protected-upload setup, cancellation, loading failures and retry. Passphrase-only protection remains available without creating or unlocking a vault.
+
+### Compatibility and verification
+
+- Preserve the account isolation, transfer recovery, vault recovery drills, protected media handling, search, HEIC previews and release protections shipped in 4.0.0.
+- TDENC2 remains a frozen-format beta with independent cryptographic review pending. Existing vaults, settings, queues, sessions and lifetime supporter activations remain compatible.
+- Every feature remains available without payment. The optional $5.00 USD one-time lifetime ad-free license, recovery codes and three-device allowance are unchanged.
+- Android is compiled locally and published independently as a separate binary release. Android project and source changes are excluded from this desktop release.
+- Automated browser, native, Worker, localization, security, dependency, packaging and provenance checks remain release gates. Live Telegram, physical-device and manual installed-platform acceptance remain separate from controlled-fixture results.
+
 ## [4.0.0] - 2026-10-05
 
 ### Highlights

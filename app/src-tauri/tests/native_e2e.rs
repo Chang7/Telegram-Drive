@@ -9143,3 +9143,35 @@ fn heic_pin_markers_do_not_survive_canceled_rendition_publication() {
     app.ok(json!({"command":"asset_pin","owner":"101","pinned":false}));
     app.ok(json!({"command":"asset_clear","owner":"101","category":"previews"}));
 }
+
+#[test]
+fn video_caption_choice_survives_interrupted_upload_restart() {
+    let fixture = Fixture::new();
+    fixture.write("Holiday video.mp4", b"synthetic video boundary fixture");
+    let mut app = Backend::start(&fixture.0);
+    for (id, enabled) in [("caption-on", true), ("caption-off", false)] {
+        app.ok(json!({"command":"save_transfer","job":{
+            "id":id,"ownerId":"101","direction":"upload","kind":"local_upload",
+            "status":"uploading","path":fixture.path("Holiday video.mp4"),
+            "filename":"Holiday video.mp4","videoUploadMode":"media","videoFilenameCaption":enabled,
+            "protectionMode":"standard","progress":50,"transferredBytes":15,"totalBytes":30,
+            "speedBytesPerSec":10,"queuePosition":0,"revision":1,"createdAt":1,"updatedAt":2
+        }}));
+    }
+    app.stop();
+    let mut app = Backend::start(&fixture.0);
+    let recovered = app.ok(json!({"command":"transfers"}));
+    for (id, enabled) in [("caption-on", true), ("caption-off", false)] {
+        let job = recovered
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["id"] == id)
+            .unwrap();
+        assert_eq!(job["videoFilenameCaption"], enabled);
+        assert_eq!(job["videoUploadMode"], "media");
+        assert_eq!(job["status"], "paused");
+        assert_eq!(job["ownerId"], "101");
+    }
+    app.stop();
+}
