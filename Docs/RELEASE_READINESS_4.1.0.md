@@ -41,3 +41,12 @@ The isolated desktop export excludes Android project/source/test changes and tem
 The tag workflow must independently pass dependency assurance, release verification, all platform builds and packaged startup, signing as configured, checksums/SBOMs/provenance generation and draft publication gates. This local report does not predeclare those future jobs passed. Downloaded artifact checksum and GitHub attestation verification follow publication.
 
 Live Telegram, physical Android/TV devices, native-speaker review, PayPal sandbox, and manual installed desktop upgrade/OS acceptance are unrun for this candidate. The historical 4.0.0 owner decisions in [RELEASE_ACCEPTANCE.md](RELEASE_ACCEPTANCE.md) are not rewritten as 4.1.0 test results. Controlled fixtures prove only their documented boundaries. Android signed-build and upgrade evidence is recorded separately after local compilation; no Android source is published.
+
+
+## Published release evidence
+
+Desktop [v4.1.0](https://github.com/caamer20/Telegram-Drive/releases/tag/v4.1.0) was published as a full stable release at2026-10-13T08:21:11Z from `c65f2fb302fa047e98eca49a53ce3b1105708879`. [Release run38364877048](https://github.com/caamer20/Telegram-Drive/actions/runs/38364877048) completed successfully: release invariants, dependency assurance, Windows/Linux/macOS Intel/macOS Apple Silicon packages and packaged startup, Arch packaging, release assurance and final publication. The schedule-only baseline-margin job was skipped by its existing conditional; the release baseline and dependency gates passed.
+
+The release contains23 assets: platform installers/updater archives and signatures, updater metadata, Arch package, SHA256SUMS, source/runtime SBOMs and Sigstore bundles. Desktop remains the repository's stable latest release. The full actual outgoing range was inspected and passed the Android publication guard before push; no new Android source/project/test files or signing credentials were published.
+
+A downloaded Intel DMG matched both SHA256SUMS and the release asset digest: `194a159364e1a86db5eb104e87e64d245f4e925b19e6603b6bc1468271de6860`. GitHub attestation verification passed, identifying `.github/workflows/release.yml@refs/tags/v4.1.0`, the expected repository, source digest `c65f2fb302fa047e98eca49a53ce3b1105708879` and run38364877048. Artifact verification does not fill the unrun live-service, physical-device or manual installed-upgrade acceptance rows above.
