@@ -20,7 +20,9 @@ use crate::resumable_upload::{
 use crate::vpn_optimizer::{backoff_ms, NetworkConfig};
 use crate::TelegramState;
 use base64::Engine;
-use grammers_client::types::{Attribute, Media, Peer};
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use grammers_client::types::Attribute;
+use grammers_client::types::{Media, Peer};
 use grammers_client::InputMessage;
 use grammers_tl_types as tl;
 use serde::{Deserialize, Serialize};
@@ -154,6 +156,7 @@ impl VideoUploadMode {
     }
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
 #[derive(Clone, Copy)]
 struct VideoUploadMetadata {
     duration: std::time::Duration,
@@ -162,6 +165,7 @@ struct VideoUploadMetadata {
     mime_type: &'static str,
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
 fn is_mp4_family_video(path: &str) -> bool {
     matches!(
         std::path::Path::new(path)
@@ -174,6 +178,7 @@ fn is_mp4_family_video(path: &str) -> bool {
     )
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
 async fn prepare_video_upload_metadata(
     source_path: &str,
     upload_name: &str,
@@ -234,6 +239,29 @@ async fn prepare_video_upload_metadata(
         height: i32::try_from(parsed.2).unwrap_or(i32::MAX),
         mime_type: inferred_mime_type(upload_name),
     }))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn prepare_video_upload_metadata(
+    source: &str,
+    name: &str,
+    mode: VideoUploadMode,
+    account: &crate::workspace::AccountGuard,
+    cancel: &mut oneshot::Receiver<()>,
+    resource: Option<std::path::PathBuf>,
+    bandwidth: Arc<BandwidthManager>,
+) -> Result<Option<crate::desktop_video_upload::VideoUploadMetadata>, String> {
+    crate::desktop_video_upload::prepare_for_account(
+        source,
+        name,
+        mode == VideoUploadMode::Media,
+        inferred_mime_type(name),
+        resource,
+        bandwidth,
+        account,
+        cancel,
+    )
+    .await
 }
 
 impl UploadProtectionMode {
@@ -2243,6 +2271,12 @@ pub async fn cmd_validate_dropped_paths(paths: Vec<String>) -> DroppedPathValida
 /// Keep Unicode scalars intact and count UTF-16 units conservatively, without
 /// applying Markdown/HTML parsing to literal filenames. Encrypted uploads never
 /// use this caption path: their metadata stays inside the encrypted envelope.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn video_filename_caption_text(filename: &str, enabled: Option<bool>) -> String {
+    crate::desktop_video_upload::caption(filename, enabled)
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
 fn video_filename_caption_text(filename: &str, enabled: Option<bool>) -> String {
     if !enabled.unwrap_or(true) {
         return String::new();
@@ -2492,6 +2526,26 @@ async fn cmd_upload_file_inner(
         .unwrap_or_else(|| "file".to_string());
     // Inspect metadata before reserving transfer quota so a malformed video
     // cannot strand a bandwidth reservation.
+    let tid = transfer_id.unwrap_or_default();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let (_cancellation, mut cancel_rx) = UploadCancellation::register(&tid);
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if state.cancelled_transfers.read().await.contains(&tid) {
+        state.cancelled_transfers.write().await.remove(&tid);
+        return Err("Transfer cancelled".into());
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let video_metadata = prepare_video_upload_metadata(
+        &path,
+        &file_name,
+        video_upload_mode,
+        &transfer_account,
+        &mut cancel_rx,
+        app_handle.path().resource_dir().ok(),
+        bw_state.inner().clone(),
+    )
+    .await?;
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     let video_metadata =
         prepare_video_upload_metadata(&path, &file_name, video_upload_mode).await?;
     let video_caption = video_filename_caption_text(&file_name, video_filename_caption);
@@ -2502,8 +2556,6 @@ async fn cmd_upload_file_inner(
         }
         None => BandwidthReservation::upload(bw_state.inner().clone(), size)?,
     };
-
-    let tid = transfer_id.unwrap_or_default();
 
     let client_opt = { state.client.lock().await.clone() };
     #[cfg(debug_assertions)]
@@ -2554,6 +2606,7 @@ async fn cmd_upload_file_inner(
         state.cancelled_transfers.write().await.remove(&tid);
         return Err("Transfer cancelled".to_string());
     }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     let (_cancellation, mut cancel_rx) = UploadCancellation::register(&tid);
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
@@ -2602,6 +2655,9 @@ async fn cmd_upload_file_inner(
             }
         };
 
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let message = InputMessage::new().text("").file(uploaded_file.clone());
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let message = match video_metadata {
             Some(video) => InputMessage::new()
                 .text(video_caption.clone())
@@ -2620,7 +2676,34 @@ async fn cmd_upload_file_inner(
         let mut last_err = String::new();
         for attempt in 0..=max_retries {
             transfer_account.validate()?;
-            match client.send_message(&peer, message.clone()).await {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let publication = if let Some(video) = video_metadata.as_ref() {
+                crate::desktop_video_upload::publish(
+                    video,
+                    uploaded_file.clone(),
+                    video_caption.clone(),
+                    &crate::desktop_video_upload::TelegramTransport {
+                        client: &client,
+                        peer: &peer,
+                    },
+                    &transfer_account,
+                    bw_state.inner().clone(),
+                    net_config.inner().clone(),
+                    &mut cancel_rx,
+                )
+                .await
+            } else {
+                client
+                    .send_message(&peer, message.clone())
+                    .await
+                    .map_err(map_error)
+            };
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let publication = client
+                .send_message(&peer, message.clone())
+                .await
+                .map_err(map_error);
+            match publication {
                 Ok(sent) => {
                     crate::file_inventory::changed(&transfer_account, folder_id, &[])?;
                     upload_reservation.commit();
@@ -2645,7 +2728,14 @@ async fn cmd_upload_file_inner(
                     return Ok(sent.id().to_string());
                 }
                 Err(e) => {
-                    let err = map_error(e);
+                    let err = e;
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if err == "Transfer cancelled"
+                        || err.starts_with("ACCOUNT_CHANGED")
+                        || err.starts_with("[VIDEO_SOURCE_CHANGED]")
+                    {
+                        return Err(err);
+                    }
                     log::warn!(
                         "send_message attempt {}/{}: {}",
                         attempt + 1,
@@ -2681,7 +2771,10 @@ async fn cmd_upload_file_inner(
                 resumable.discard().await?;
             }
             // Telegram no longer holds what an earlier attempt sent.
-            if resumed && !restarted {
+            let can_restart = resumed
+                || (cfg!(not(any(target_os = "android", target_os = "ios")))
+                    && video_metadata.is_some());
+            if can_restart && !restarted {
                 restarted = true;
                 continue;
             }
@@ -6173,14 +6266,34 @@ async fn cmd_upload_from_url_owned(
             })
             .unwrap_or_else(|| "remote_file".to_string())
     });
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let (_cancellation, mut cancel_rx) = UploadCancellation::register(&transfer_id);
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if state
+        .cancelled_transfers
+        .read()
+        .await
+        .contains(&transfer_id)
+    {
+        let _ = tokio::fs::remove_file(&temp_file_path).await;
+        return Err("Transfer cancelled".into());
+    }
     let video_caption = video_filename_caption_text(&file_name, video_filename_caption);
-    let video_metadata = match prepare_video_upload_metadata(
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let preparation = prepare_video_upload_metadata(
         &temp_file_str,
         &file_name,
         parsed_video_upload,
+        &transfer_account,
+        &mut cancel_rx,
+        app_handle.path().resource_dir().ok(),
+        bw_state.inner().clone(),
     )
-    .await
-    {
+    .await;
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let preparation =
+        prepare_video_upload_metadata(&temp_file_str, &file_name, parsed_video_upload).await;
+    let video_metadata = match preparation {
         Ok(metadata) => metadata,
         Err(error) => {
             let _ = tokio::fs::remove_file(&temp_file_path).await;
@@ -6277,7 +6390,9 @@ async fn cmd_upload_from_url_owned(
         return Err("Transfer cancelled".to_string());
     }
 
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     get_upload_cancellations()
         .lock()
         .unwrap()
@@ -6301,6 +6416,7 @@ async fn cmd_upload_from_url_owned(
     let uploaded_file = {
         tokio::select! {
             res = &mut upload_task => {
+                #[cfg(any(target_os = "android", target_os = "ios"))]
                 get_upload_cancellations().lock().unwrap().remove(&transfer_id);
                 match res {
                     Ok(Ok(file)) => file,
@@ -6316,7 +6432,7 @@ async fn cmd_upload_from_url_owned(
                     }
                 }
             }
-            _ = cancel_rx => {
+            _ = &mut cancel_rx => {
                 log::info!("Aborting remote upload task for transfer ID: {}", transfer_id);
                 upload_task.abort();
                 state.cancelled_transfers.write().await.remove(&transfer_id);
@@ -6329,6 +6445,9 @@ async fn cmd_upload_from_url_owned(
 
     progress_task.abort();
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let message = InputMessage::new().text("").file(uploaded_file.clone());
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     let message = match video_metadata {
         Some(video) => InputMessage::new()
             .text(video_caption)
@@ -6361,14 +6480,49 @@ async fn cmd_upload_from_url_owned(
 
     for attempt in 0..=max_retries {
         transfer_account.validate()?;
-        match client.send_message(&peer, message.clone()).await {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let publication = if let Some(video) = video_metadata.as_ref() {
+            crate::desktop_video_upload::publish(
+                video,
+                uploaded_file.clone(),
+                video_caption.clone(),
+                &crate::desktop_video_upload::TelegramTransport {
+                    client: &client,
+                    peer: &peer,
+                },
+                &transfer_account,
+                bw_state.inner().clone(),
+                net_config.inner().clone(),
+                &mut cancel_rx,
+            )
+            .await
+        } else {
+            client
+                .send_message(&peer, message.clone())
+                .await
+                .map_err(map_error)
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let publication = client
+            .send_message(&peer, message.clone())
+            .await
+            .map_err(map_error);
+        match publication {
             Ok(_) => {
                 crate::file_inventory::changed(&transfer_account, folder_id, &[])?;
                 send_success = true;
                 break;
             }
             Err(e) => {
-                let err = map_error(e);
+                let err = e;
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                if err == "Transfer cancelled"
+                    || err.starts_with("ACCOUNT_CHANGED")
+                    || err.starts_with("[VIDEO_SOURCE_CHANGED]")
+                {
+                    let _ = tokio::fs::remove_file(&temp_file_path).await;
+                    return Err(err);
+                }
                 log::warn!(
                     "send_message attempt {}/{}: {}",
                     attempt + 1,
