@@ -1,3 +1,18 @@
+## [4.1.1] - 2026-10-13
+
+### Desktop video media uploads
+
+- Attach a locally generated JPEG preview and explicit dimensions/duration to unencrypted MP4 Media uploads, including large files and uploads from a URL. This supplies the thumbnail and video attributes Telegram Desktop needs to display its player.
+- Set streaming metadata from the MP4 container layout while preserving the original video bytes. Videos with metadata at the end of the file may still need downloading before playback.
+- Use the native Windows video decoder first, with FFmpeg as a fallback. macOS and Linux require FFmpeg for video thumbnails; an unavailable decoder offers File mode instead of silently uploading incomplete Media metadata.
+- Preserve filename captions, account isolation, cancellation, retries and transfer quotas. Protected videos retain their existing private upload path.
+
+### Compatibility and verification
+
+- Existing vaults, sessions, queues, settings and lifetime supporter activations remain compatible. Every feature remains available without payment; the optional $5.00 USD one-time lifetime ad-free license, recovery codes and three-device allowance are unchanged.
+- Desktop native and browser regressions passed, including synthetic H.264 MP4 containers over 200 MiB and Windows native decoding. Automated Telegram boundaries use controlled fixtures; the reporter's exact file/codec, live Telegram Desktop playback and rotated-video acceptance remain unrun.
+- Android 4.1.0 remains a separate APK release. The product page deploys from the protected main branch after stable Desktop publication.
+
 ## [4.1.0] - 2026-10-13
 
 ### Video uploads and settings
