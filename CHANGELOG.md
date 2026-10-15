@@ -18,7 +18,7 @@
 
 ### Verification
 
-- The existing large-container upload journey failed at the streaming-flag assertion before the correction. All 215 native journeys and 23 targeted browser journeys passed locally, including captions, sync settings, slideshow, visual and accessibility checks; full release suites and platform package checks remain publication gates.
+- The existing large-container upload journey failed at the streaming-flag assertion before the correction. All 215 native journeys and all 133 browser journeys passed locally, including captions, sync settings, slideshow, visual, accessibility and TV keyboard navigation checks; full release suites and platform package checks remain publication gates.
 - Automated Telegram boundaries use controlled fixtures. Streaming and seeking with the reporter's actual video over 200 MB on a clean Windows Telegram Desktop receiver remain pending owner acceptance after this release.
 
 ## [4.1.1] - 2026-10-13
