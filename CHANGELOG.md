@@ -1,3 +1,16 @@
+## [4.1.2] - 2026-10-14
+
+### Desktop video streaming metadata
+
+- Correct the overly restrictive MP4 streaming-eligibility check introduced in 4.1.1. Valid trailing-metadata layouts accepted by Telegram Desktop now receive the matching streaming flag for local and URL Media uploads.
+- Preserve the original video bytes, JPEG previews, dimensions, duration and filename captions. File mode, protected uploads, resumable transfers, cancellation, account isolation and quota checks retain their existing paths.
+- Existing sessions, vaults, settings and lifetime supporter activations remain compatible. The optional $5.00 USD one-time lifetime ad-free license and recovery rights are unchanged.
+
+### Verification
+
+- The existing large-container upload journey failed at the streaming-flag assertion before the correction. All 24 focused native upload journeys and the filename-caption browser journey passed locally after it; the full release suites and platform package checks remain publication gates.
+- Automated Telegram boundaries use controlled fixtures. Streaming and seeking with the reporter's actual video over 200 MB on a clean Windows Telegram Desktop receiver remain pending owner acceptance after this release.
+
 ## [4.1.1] - 2026-10-13
 
 ### Desktop video media uploads
