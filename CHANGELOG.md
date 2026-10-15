@@ -6,6 +6,10 @@
 - Preserve the original video bytes, JPEG previews, dimensions, duration and filename captions. File mode, protected uploads, resumable transfers, cancellation, account isolation and quota checks retain their existing paths.
 - Existing sessions, vaults, settings and lifetime supporter activations remain compatible. The optional $5.00 USD one-time lifetime ad-free license and recovery rights are unchanged.
 
+### Dependency security
+
+- Update Rustls to [0.23.46](https://github.com/rustls/rustls/releases/tag/v/0.23.46), addressing the upstream TLS advisories detected by the release dependency gate.
+
 ### Verification
 
 - The existing large-container upload journey failed at the streaming-flag assertion before the correction. All 24 focused native upload journeys and the filename-caption browser journey passed locally after it; the full release suites and platform package checks remain publication gates.
