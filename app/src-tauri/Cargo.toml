@@ -45,7 +45,9 @@ base64 = "0.22"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 log = "0.4"
 env_logger = "0.11"
-tauri-plugin-updater = "2"
+# createUpdaterArtifacts=true publishes native v2 installers. Keep TLS, not
+# the optional vulnerable ZIP support for legacy v1 Windows/Linux bundles.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
 actix-web = "4"
 actix-cors = "0.7"
 actix-files = "0.6"
@@ -73,7 +75,7 @@ hkdf = "0.12"
 hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 sevenz-rust2 = "0.7"
 path-clean = "1"
 walkdir = "2"

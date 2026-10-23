@@ -50,6 +50,19 @@ const updater = config.plugins?.updater;
 if (!updater?.pubkey || !updater.endpoints?.length || !updater.endpoints.every(value => value.startsWith('https://'))) {
   throw new Error('Signed desktop updates require a public key and HTTPS endpoints.');
 }
+// Native v2 update artifacts do not require the legacy Windows ZIP/Linux tar support.
+if (config.bundle?.createUpdaterArtifacts !== true) {
+  throw new Error('Desktop updates must use native v2 updater artifacts.');
+}
+const manifest = fs.readFileSync(path.join(root, 'src-tauri/Cargo.toml'), 'utf8');
+const updaterDependency = manifest.match(/^tauri-plugin-updater\s*=\s*\{([^\n]+)\}/m)?.[1] || '';
+const updaterFeatures = updaterDependency.match(/\bfeatures\s*=\s*(\[[^\]]*\])/)?.[1];
+if (!/\bdefault-features\s*=\s*false\b/.test(updaterDependency)
+    || !updaterFeatures
+    || !JSON.parse(updaterFeatures).includes('rustls-tls')
+    || JSON.parse(updaterFeatures).includes('zip')) {
+  throw new Error('Desktop updater must preserve rustls-tls with default features and legacy zip disabled.');
+}
 // The published REST contract and the registered routes describe the same API.
 const routes = new Set([...fs.readFileSync(path.join(root, 'src-tauri/src/api_routes.rs'), 'utf8')
   .matchAll(/^#\[(get|post|patch|put|delete)\("([^"]+)"\)\]/gm)].map(([, method, route]) => `${method} ${route}`));

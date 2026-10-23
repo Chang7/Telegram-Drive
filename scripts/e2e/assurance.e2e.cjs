@@ -25,6 +25,45 @@ function success(result) {
   assert.equal(result.status, 0, result.stderr || result.stdout);
 }
 
+test('desktop updater policy rejects legacy bundles and ZIP feature regressions', t => {
+  const directory = fixture(t);
+  const repository = path.resolve(scripts, '..');
+  for (const name of ['scripts/check-app-security.cjs', '.cargo/config.toml',
+    'app/src-tauri/Cargo.toml', 'app/src-tauri/Cargo.lock', 'app/src-tauri/build.rs',
+    'app/src-tauri/build/search-support.rs', 'app/src-tauri/tauri.conf.json',
+    'app/src-tauri/capabilities/mobile.json', 'app/src-tauri/capabilities/default.json',
+    'app/src-tauri/src/api_routes.rs', 'app/src-tauri/api/openapi-v1.json']) {
+    const destination = path.join(directory, name);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(path.join(repository, name), destination);
+  }
+  const check = () => {
+    const result = spawnSync(process.execPath, [path.join(directory, 'scripts/check-app-security.cjs')],
+      { encoding: 'utf8', timeout: 15_000 });
+    assert.ifError(result.error);
+    return result;
+  };
+  success(check());
+  const configPath = path.join(directory, 'app/src-tauri/tauri.conf.json');
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  config.bundle.createUpdaterArtifacts = 'v1Compatible';
+  fs.writeFileSync(configPath, JSON.stringify(config));
+  assert.match(check().stderr, /native v2 updater artifacts/);
+  config.bundle.createUpdaterArtifacts = true;
+  fs.writeFileSync(configPath, JSON.stringify(config));
+  const manifestPath = path.join(directory, 'app/src-tauri/Cargo.toml');
+  const manifest = fs.readFileSync(manifestPath, 'utf8');
+  const replaceUpdater = line => fs.writeFileSync(manifestPath, manifest.replace(/^tauri-plugin-updater.*$/m, line));
+  for (const dependency of ['"2"',
+    '{ version = "2", default-features = false, features = ["rustls-tls", "zip"] }',
+    '{ version = "2", default-features = false, features = [] }']) {
+    replaceUpdater('tauri-plugin-updater = ' + dependency);
+    assert.match(check().stderr, /preserve rustls-tls/);
+  }
+  fs.writeFileSync(manifestPath, manifest);
+  success(check());
+});
+
 test('release artifacts pass through SBOM generation and an independently verified checksum manifest', t => {
   const directory = fixture(t);
   const report = path.join(directory, 'gradle-dependencies.txt');
