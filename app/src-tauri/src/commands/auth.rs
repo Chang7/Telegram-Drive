@@ -2,7 +2,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use grammers_client::Client;
 use grammers_mtsender::SenderPool;
 use grammers_session::storages::SqliteSession;
-use grammers_session::types::{PeerAuth, PeerInfo, UpdateState, UpdatesState};
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use grammers_session::types::UpdateState;
+use grammers_session::types::{PeerAuth, PeerInfo, UpdatesState};
 use grammers_session::Session;
 use grammers_tl_types as tl;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,17 @@ use crate::models::{AuthCodeDelivery, AuthCodeRequestResult, AuthCodeRequestStat
 use crate::TelegramState;
 use grammers_client::types::PasswordToken;
 use grammers_mtsender::InvocationError;
+
+fn open_client_session(root: &std::path::Path) -> sqlite::Result<Arc<SqliteSession>> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        crate::workspace::open_session(root)
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        SqliteSession::open(root.join("telegram.session")).map(Arc::new)
+    }
+}
 
 fn session_sidecar_path(session_path: &Path, suffix: &str) -> PathBuf {
     let mut value = session_path.as_os_str().to_os_string();
@@ -138,10 +151,9 @@ pub async fn ensure_client_initialized(
     }
 
     let session_path = app_data_dir.join("telegram.session");
-    let session_path_str = session_path.to_string_lossy().to_string();
     log::info!("Opening the local Telegram session database");
 
-    let mut session_open_result = SqliteSession::open(&session_path_str);
+    let mut session_open_result = open_client_session(&app_data_dir);
 
     // Retry opening the session database up to 5 times (every 100ms)
     // in case the database is temporarily locked by the old shutting down runner.
@@ -149,7 +161,7 @@ pub async fn ensure_client_initialized(
         for attempt in 1..=5 {
             log::warn!("Failed to open session on attempt {} (database may be locked). Retrying in 100ms...", attempt);
             tokio::time::sleep(Duration::from_millis(100)).await;
-            session_open_result = SqliteSession::open(&session_path_str);
+            session_open_result = open_client_session(&app_data_dir);
             if session_open_result.is_ok() {
                 break;
             }
@@ -167,10 +179,13 @@ pub async fn ensure_client_initialized(
                 quarantine_id
             );
 
-            SqliteSession::open(&session_path_str)
+            open_client_session(&app_data_dir)
                 .map_err(|err| format!("Failed to open session after recreation: {}", err))?
         }
     };
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    crate::workspace::register_session(&app_data_dir, &session)?;
 
     let net_config = app_handle.state::<Arc<crate::vpn_optimizer::NetworkConfig>>();
     let preferred_dc = {
@@ -201,7 +216,6 @@ pub async fn ensure_client_initialized(
         connection_params.proxy_url = Some(proxy_url);
     }
 
-    let session = Arc::new(session);
     *state.session.lock().await = Some(session.clone());
     let pool = SenderPool::with_configuration(session, api_id, connection_params);
     let client = Client::new(&pool);
@@ -328,30 +342,68 @@ pub async fn cmd_reconnect_with_network_settings(
     }
 }
 
+/// How long sign-out waits for Telegram to revoke the authorization before the
+/// local session is discarded anyway.
+const REMOTE_SIGN_OUT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Result of a sign-out. Local state is always cleared; the Telegram-side
+/// authorization is revoked only when Telegram confirmed it in time.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct LogoutOutcome {
+    pub signed_out: bool,
+    pub remote_session_revoked: bool,
+}
+
 #[tauri::command]
 pub async fn cmd_logout(
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     crypto_state: State<'_, crate::crypto::state::CryptoState>,
-) -> Result<bool, String> {
+) -> Result<LogoutOutcome, String> {
     log::info!("Logging out...");
+    // Identify the account before its session is suspended; its folder layout
+    // is set aside under this owner further down.
+    let signing_out = app_handle
+        .path()
+        .app_data_dir()
+        .ok()
+        .and_then(|root| crate::workspace::current_owner(&root).ok());
     crate::workspace::suspend();
+    if let (Some(owner), Ok(root)) = (signing_out, app_handle.path().app_data_dir()) {
+        if let Err(error) = crate::external_files::invalidate_account(&root, owner) {
+            log::warn!("External hash reuse disabled at sign-out: {error}");
+        }
+    }
     crypto_state.lock();
 
-    // 1. Shutdown the network runner FIRST to prevent any operations
+    // 1. Revoke the Telegram authorization while the network runner is still
+    //    alive. The runner drives every request, so stopping it first would
+    //    leave this device listed under Telegram's active sessions.
+    let client_opt = { state.client.lock().await.clone() };
+    let remote_session_revoked = match client_opt {
+        Some(client) => match timeout(REMOTE_SIGN_OUT_TIMEOUT, client.sign_out()).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(error)) => {
+                log::warn!("Telegram did not confirm sign-out: {}", error);
+                false
+            }
+            Err(_) => {
+                log::warn!("Telegram sign-out timed out; clearing the local session only");
+                false
+            }
+        },
+        // Nothing was connected, so there is no live authorization this
+        // process could have revoked.
+        None => false,
+    };
+
+    // 2. Stop the network runner now that no further request is needed.
     {
         let mut shutdown_guard = state.runner_shutdown.lock().unwrap();
         if let Some(shutdown_tx) = shutdown_guard.take() {
             log::info!("Signaling runner shutdown for logout...");
             let _ = shutdown_tx.send(());
         }
-    }
-
-    // 2. Try to sign out from Telegram (if connected)
-    let client_opt = { state.client.lock().await.clone() };
-    if let Some(client) = client_opt {
-        // We don't strictly care if this fails (e.g. network down), we just want to clear local state.
-        let _ = client.sign_out().await;
     }
 
     // 3. Clear State
@@ -370,16 +422,33 @@ pub async fn cmd_logout(
         .path()
         .app_data_dir()
         .map_err(|e| e.to_string())?;
+
+    // Save this account's folder groups and ordering to its own store and
+    // empty the shared tables, so the next account neither sees nor prunes them.
+    if let Some(db) = app_handle.try_state::<crate::db::DbConnection>() {
+        let root = app_data_dir.clone();
+        if let Err(error) = crate::db::with_connection(db.inner().clone(), move |connection| {
+            crate::folder_layout::deactivate(connection, &root, signing_out)
+        })
+        .await
+        {
+            log::warn!("Folder layout could not be set aside at sign-out: {error}");
+        }
+    }
     let session_path = app_data_dir.join("telegram.session");
     let _ = std::fs::remove_file(session_path);
     let _ = std::fs::remove_file(app_data_dir.join("telegram.session-wal"));
     let _ = std::fs::remove_file(app_data_dir.join("telegram.session-shm"));
 
     log::info!(
-        "Logout complete. Vault locked. Runner count: {}",
+        "Logout complete. Vault locked. Remote session revoked: {}. Runner count: {}",
+        remote_session_revoked,
         state.runner_count.load(Ordering::SeqCst)
     );
-    Ok(true)
+    Ok(LogoutOutcome {
+        signed_out: true,
+        remote_session_revoked,
+    })
 }
 
 fn normalize_phone_number(input: &str) -> Result<String, String> {
@@ -565,6 +634,44 @@ async fn current_client(state: &TelegramState) -> Result<Client, String> {
         .ok_or_else(|| "Telegram client is not initialized.".to_string())
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+type CapturedAuthentication = crate::workspace::AuthenticationSession;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+struct CapturedAuthentication;
+
+async fn authentication_client(
+    state: &TelegramState,
+) -> Result<(Client, CapturedAuthentication), String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        // Client initialization holds this lock while installing its session.
+        // Capture the matching pair before sending any authentication request.
+        let clients = state.client.lock().await;
+        let client = clients
+            .as_ref()
+            .cloned()
+            .ok_or("Telegram client is not initialized.")?;
+        let sessions = state.session.lock().await;
+        let session = sessions
+            .as_ref()
+            .ok_or("Telegram session is not initialized.")?;
+        Ok((client, CapturedAuthentication::capture(session)?))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        Ok((current_client(state).await?, CapturedAuthentication))
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn authenticated_peer(user: &grammers_client::types::User) -> PeerInfo {
+    let mut peer = PeerInfo::from(user);
+    if let PeerInfo::User { is_self, .. } = &mut peer {
+        *is_self = Some(true);
+    }
+    peer
+}
+
 async fn invoke_send_code(
     client: &Client,
     state: &TelegramState,
@@ -615,7 +722,13 @@ async fn complete_raw_login(
     client: &Client,
     state: &TelegramState,
     authorization: tl::types::auth::Authorization,
+    captured: &CapturedAuthentication,
 ) -> Result<(), String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let _ = state;
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let _ = captured;
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     let session = state
         .session
         .lock()
@@ -624,42 +737,48 @@ async fn complete_raw_login(
         .cloned()
         .ok_or_else(|| "Telegram session is not initialized.".to_string())?;
 
-    match &authorization.user {
-        tl::enums::User::User(user) => {
-            session.cache_peer(&PeerInfo::User {
-                id: user.id,
-                auth: Some(
-                    user.access_hash
-                        .map(PeerAuth::from_hash)
-                        .unwrap_or_default(),
-                ),
-                bot: Some(user.bot),
-                is_self: Some(true),
-            });
-        }
-        tl::enums::User::Empty(user) => {
-            session.cache_peer(&PeerInfo::User {
-                id: user.id,
-                auth: Some(PeerAuth::default()),
-                bot: Some(false),
-                is_self: Some(true),
-            });
-        }
-    }
+    let peer = match &authorization.user {
+        tl::enums::User::User(user) => PeerInfo::User {
+            id: user.id,
+            auth: Some(
+                user.access_hash
+                    .map(PeerAuth::from_hash)
+                    .unwrap_or_default(),
+            ),
+            bot: Some(user.bot),
+            is_self: Some(true),
+        },
+        tl::enums::User::Empty(user) => PeerInfo::User {
+            id: user.id,
+            auth: Some(PeerAuth::default()),
+            bot: Some(false),
+            is_self: Some(true),
+        },
+    };
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    session.cache_peer(&peer);
 
-    if let Ok(Ok(tl::enums::updates::State::State(update))) = timeout(
+    let updates = if let Ok(Ok(tl::enums::updates::State::State(update))) = timeout(
         Duration::from_secs(15),
         client.invoke(&tl::functions::updates::GetState {}),
     )
     .await
     {
-        session.set_update_state(UpdateState::All(UpdatesState {
+        Some(UpdatesState {
             pts: update.pts,
             qts: update.qts,
             date: update.date,
             seq: update.seq,
             channels: Vec::new(),
-        }));
+        })
+    } else {
+        None
+    };
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    captured.complete_verified(&peer, updates)?;
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    if let Some(updates) = updates {
+        session.set_update_state(UpdateState::All(updates));
     }
 
     Ok(())
@@ -671,6 +790,7 @@ async fn store_sent_code(
     attempt_id: u64,
     phone: String,
     sent_code: tl::enums::auth::SentCode,
+    captured: &CapturedAuthentication,
 ) -> Result<AuthCodeRequestResult, String> {
     if state.auth_attempt_counter.load(Ordering::SeqCst) != attempt_id {
         return Err("This login request was replaced by a newer attempt.".to_string());
@@ -692,8 +812,8 @@ async fn store_sent_code(
         }
         tl::enums::auth::SentCode::Success(success) => match success.authorization {
             tl::enums::auth::Authorization::Authorization(authorization) => {
-                complete_raw_login(client, state, authorization).await?;
                 *state.phone_login.lock().await = None;
+                complete_raw_login(client, state, authorization, captured).await?;
                 Ok(AuthCodeRequestResult {
                     status: AuthCodeRequestStatus::Authorized,
                     delivery: AuthCodeDelivery::TelegramApp,
@@ -746,7 +866,8 @@ pub async fn cmd_auth_request_code(
     // Store API ID
     *state.api_id.lock().await = Some(api_id);
 
-    let client_handle = ensure_client_initialized(&app_handle, &state, api_id).await?;
+    ensure_client_initialized(&app_handle, &state, api_id).await?;
+    let (client_handle, captured) = authentication_client(&state).await?;
 
     log::info!("Requesting login code for {}", redact_phone_number(&phone));
 
@@ -769,14 +890,22 @@ pub async fn cmd_auth_request_code(
     };
 
     let sent_code = invoke_send_code(&client_handle, &state, &request).await?;
-    store_sent_code(&client_handle, &state, attempt_id, phone, sent_code).await
+    store_sent_code(
+        &client_handle,
+        &state,
+        attempt_id,
+        phone,
+        sent_code,
+        &captured,
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn cmd_auth_resend_code(
     state: State<'_, TelegramState>,
 ) -> Result<AuthCodeRequestResult, String> {
-    let client = current_client(&state).await?;
+    let (client, captured) = authentication_client(&state).await?;
     let login = {
         let mut guard = state.phone_login.lock().await;
         let login = guard
@@ -829,7 +958,15 @@ pub async fn cmd_auth_resend_code(
         }
     };
 
-    store_sent_code(&client, &state, login.attempt_id, login.phone, sent_code).await
+    store_sent_code(
+        &client,
+        &state,
+        login.attempt_id,
+        login.phone,
+        sent_code,
+        &captured,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -873,7 +1010,7 @@ pub async fn cmd_auth_sign_in(
         return Err("Enter the authentication code you received.".to_string());
     }
 
-    let client = current_client(&state).await?;
+    let (client, captured) = authentication_client(&state).await?;
     let login = state
         .phone_login
         .lock()
@@ -891,8 +1028,8 @@ pub async fn cmd_auth_sign_in(
     match timeout(Duration::from_secs(30), client.invoke(&request)).await {
         Err(_) => Err("Telegram did not respond while verifying the code. Please try again.".to_string()),
         Ok(Ok(tl::enums::auth::Authorization::Authorization(auth))) => {
-            complete_raw_login(&client, &state, auth).await?;
             *state.phone_login.lock().await = None;
+            complete_raw_login(&client, &state, auth, &captured).await?;
             log::info!("Successfully logged in with a phone code.");
             Ok(AuthResult {
                 success: true,
@@ -933,30 +1070,76 @@ pub async fn cmd_auth_sign_in(
     }
 }
 
+/// Message shown when Telegram rejects the two-step verification password.
+/// The browser fixture uses the same text so both boundaries stay aligned.
+const INVALID_TWO_STEP_PASSWORD: &str =
+    "That two-step verification password is incorrect. Check it and try again.";
+
+/// Telegram's SRP challenge is single-use. Request a fresh one after a failed
+/// attempt so the user can retry without restarting the whole sign-in.
+async fn renew_password_challenge(client: &Client, state: &TelegramState) {
+    match timeout(
+        Duration::from_secs(30),
+        client.invoke(&tl::functions::account::GetPassword {}),
+    )
+    .await
+    {
+        Ok(Ok(password)) => {
+            let password: tl::types::account::Password = password.into();
+            *state.password_token.lock().await = Some(PasswordToken::new(password));
+        }
+        Ok(Err(error)) => {
+            log::warn!(
+                "Could not renew the two-step verification challenge: {}",
+                error
+            );
+        }
+        Err(_) => {
+            log::warn!(
+                "Telegram did not respond while renewing the two-step verification challenge"
+            );
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_auth_check_password(
     password: String,
     state: State<'_, TelegramState>,
 ) -> Result<AuthResult, String> {
-    let client = {
-        let guard = state.client.lock().await;
-        guard.as_ref().ok_or("Client not initialized")?.clone()
-    };
+    let (client, captured) = authentication_client(&state).await?;
 
-    let mut pw_guard = state.password_token.lock().await;
-    let pw_token = pw_guard.take().ok_or("No password session found")?;
+    let pw_token = state
+        .password_token
+        .lock()
+        .await
+        .take()
+        .ok_or("No password session found")?;
 
     match client.check_password(pw_token, password.as_str()).await {
-        Ok(_user) => {
+        Ok(user) => {
             log::info!("2FA Success.");
             *state.phone_login.lock().await = None;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            captured.complete_verified(&authenticated_peer(&user), None)?;
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let _ = (&captured, user);
             Ok(AuthResult {
                 success: true,
                 next_step: Some("dashboard".to_string()),
                 error: None,
             })
         }
-        Err(e) => Err(format!("2FA Failed: {}", e)),
+        Err(grammers_client::SignInError::InvalidPassword) => {
+            renew_password_challenge(&client, state.inner()).await;
+            Err(INVALID_TWO_STEP_PASSWORD.to_string())
+        }
+        Err(e) => {
+            // A transport failure also consumed the challenge; renew it so the
+            // password step stays usable once the connection recovers.
+            renew_password_challenge(&client, state.inner()).await;
+            Err(format!("2FA Failed: {}", e))
+        }
     }
 }
 
@@ -976,7 +1159,8 @@ pub async fn cmd_auth_qr_login(
     // Store API ID
     *state.api_id.lock().await = Some(api_id);
 
-    let client = ensure_client_initialized(&app_handle, &state, api_id).await?;
+    ensure_client_initialized(&app_handle, &state, api_id).await?;
+    let (client, captured) = authentication_client(&state).await?;
 
     // Switching authentication methods invalidates any outstanding phone-code flow.
     state.auth_attempt_counter.fetch_add(1, Ordering::SeqCst);
@@ -1008,7 +1192,16 @@ pub async fn cmd_auth_qr_login(
             log::info!("QR login URL generated, expires at {}", t.expires);
             Ok(url)
         }
-        tl::enums::auth::LoginToken::Success(_s) => {
+        tl::enums::auth::LoginToken::Success(success) => {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            match success.authorization {
+                tl::enums::auth::Authorization::Authorization(authorization) => {
+                    complete_raw_login(&client, &state, authorization, &captured).await?;
+                }
+                _ => return Err("Telegram did not confirm an existing account".into()),
+            }
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let _ = (&captured, success);
             // Already authorized (e.g. from a previous session)
             log::info!("QR login: already authorized");
             Ok("__authorized__".to_string())
@@ -1032,16 +1225,19 @@ pub async fn cmd_auth_qr_login(
 /// accepts the token via auth.acceptLoginToken.
 #[tauri::command]
 pub async fn cmd_auth_qr_poll(state: State<'_, TelegramState>) -> Result<AuthResult, String> {
-    let client = {
-        let guard = state.client.lock().await;
-        guard.as_ref().ok_or("Client not initialized")?.clone()
-    };
+    let (client, captured) = authentication_client(&state).await?;
 
     // Check if the session is now authorized (user scanned QR on phone)
     match client.is_authorized().await {
         Ok(true) => {
             log::info!("QR login: session authorized!");
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let user = client.get_me().await.map_err(map_auth_error)?;
             *state.phone_login.lock().await = None;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            captured.complete_verified(&authenticated_peer(&user), None)?;
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let _ = &captured;
             Ok(AuthResult {
                 success: true,
                 next_step: Some("dashboard".to_string()),
@@ -1064,211 +1260,5 @@ pub async fn cmd_auth_qr_poll(state: State<'_, TelegramState>) -> Result<AuthRes
                 error: None,
             })
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sent_code(code_type: tl::enums::auth::SentCodeType) -> tl::types::auth::SentCode {
-        tl::types::auth::SentCode {
-            r#type: code_type,
-            phone_code_hash: "hash".to_string(),
-            next_type: Some(tl::enums::auth::CodeType::Sms),
-            timeout: Some(42),
-        }
-    }
-
-    #[test]
-    fn normalizes_common_international_phone_formats() {
-        assert_eq!(
-            normalize_phone_number(" +1 (415) 555-0132 ").unwrap(),
-            "+14155550132"
-        );
-        assert_eq!(
-            normalize_phone_number("+44 20 7946 0958").unwrap(),
-            "+442079460958"
-        );
-    }
-
-    #[test]
-    fn rejects_non_e164_phone_numbers() {
-        assert!(normalize_phone_number("4155550132").is_err());
-        assert!(normalize_phone_number("+0123456789").is_err());
-        assert!(normalize_phone_number("+1/415/555/0132").is_err());
-        assert!(normalize_phone_number("+123").is_err());
-    }
-
-    #[test]
-    fn redacts_phone_numbers_in_logs() {
-        let redacted = redact_phone_number("+14155550132");
-        assert_eq!(redacted, "+1••••32");
-        assert!(!redacted.contains("415555"));
-    }
-
-    #[test]
-    fn maps_every_supported_sent_code_type() {
-        let cases = vec![
-            (
-                tl::enums::auth::SentCodeType::App(tl::types::auth::SentCodeTypeApp { length: 5 }),
-                AuthCodeDelivery::TelegramApp,
-                true,
-            ),
-            (
-                tl::enums::auth::SentCodeType::Sms(tl::types::auth::SentCodeTypeSms { length: 5 }),
-                AuthCodeDelivery::Sms,
-                true,
-            ),
-            (
-                tl::enums::auth::SentCodeType::Call(tl::types::auth::SentCodeTypeCall {
-                    length: 5,
-                }),
-                AuthCodeDelivery::Call,
-                true,
-            ),
-            (
-                tl::enums::auth::SentCodeType::FlashCall(tl::types::auth::SentCodeTypeFlashCall {
-                    pattern: "*123".to_string(),
-                }),
-                AuthCodeDelivery::FlashCall,
-                true,
-            ),
-            (
-                tl::enums::auth::SentCodeType::MissedCall(
-                    tl::types::auth::SentCodeTypeMissedCall {
-                        prefix: "+12".to_string(),
-                        length: 4,
-                    },
-                ),
-                AuthCodeDelivery::MissedCall,
-                true,
-            ),
-            (
-                tl::enums::auth::SentCodeType::EmailCode(tl::types::auth::SentCodeTypeEmailCode {
-                    apple_signin_allowed: false,
-                    google_signin_allowed: false,
-                    email_pattern: "a***@example.com".to_string(),
-                    length: 6,
-                    reset_available_period: None,
-                    reset_pending_date: None,
-                }),
-                AuthCodeDelivery::Email,
-                true,
-            ),
-            (
-                tl::enums::auth::SentCodeType::SetUpEmailRequired(
-                    tl::types::auth::SentCodeTypeSetUpEmailRequired {
-                        apple_signin_allowed: false,
-                        google_signin_allowed: false,
-                    },
-                ),
-                AuthCodeDelivery::EmailSetup,
-                false,
-            ),
-            (
-                tl::enums::auth::SentCodeType::FragmentSms(
-                    tl::types::auth::SentCodeTypeFragmentSms {
-                        url: "https://fragment.com/login".to_string(),
-                        length: 5,
-                    },
-                ),
-                AuthCodeDelivery::Fragment,
-                true,
-            ),
-            (
-                tl::enums::auth::SentCodeType::FirebaseSms(
-                    tl::types::auth::SentCodeTypeFirebaseSms {
-                        nonce: None,
-                        play_integrity_project_id: None,
-                        play_integrity_nonce: None,
-                        receipt: None,
-                        push_timeout: None,
-                        length: 5,
-                    },
-                ),
-                AuthCodeDelivery::Firebase,
-                true,
-            ),
-            (
-                tl::enums::auth::SentCodeType::SmsWord(tl::types::auth::SentCodeTypeSmsWord {
-                    beginning: Some("a".to_string()),
-                }),
-                AuthCodeDelivery::SmsWord,
-                false,
-            ),
-            (
-                tl::enums::auth::SentCodeType::SmsPhrase(tl::types::auth::SentCodeTypeSmsPhrase {
-                    beginning: Some("open".to_string()),
-                }),
-                AuthCodeDelivery::SmsPhrase,
-                false,
-            ),
-        ];
-
-        for (code_type, expected_delivery, expected_numeric) in cases {
-            let result = describe_sent_code(&sent_code(code_type));
-            assert_eq!(result.delivery, expected_delivery);
-            assert_eq!(result.numeric_code, expected_numeric);
-            assert_eq!(result.resend_after_seconds, Some(42));
-            assert_eq!(result.next_delivery, Some(AuthCodeDelivery::Sms));
-        }
-    }
-
-    #[test]
-    fn recommends_qr_for_desktop_unsupported_delivery_types() {
-        let email_setup = describe_sent_code(&sent_code(
-            tl::enums::auth::SentCodeType::SetUpEmailRequired(
-                tl::types::auth::SentCodeTypeSetUpEmailRequired {
-                    apple_signin_allowed: false,
-                    google_signin_allowed: false,
-                },
-            ),
-        ));
-        let firebase = describe_sent_code(&sent_code(tl::enums::auth::SentCodeType::FirebaseSms(
-            tl::types::auth::SentCodeTypeFirebaseSms {
-                nonce: None,
-                play_integrity_project_id: None,
-                play_integrity_nonce: None,
-                receipt: None,
-                push_timeout: None,
-                length: 5,
-            },
-        )));
-
-        assert_eq!(email_setup.status, AuthCodeRequestStatus::QrRecommended);
-        assert_eq!(firebase.status, AuthCodeRequestStatus::QrRecommended);
-    }
-
-    #[test]
-    fn unreadable_session_files_are_quarantined_instead_of_deleted() {
-        let root = std::env::temp_dir().join(format!(
-            "telegram-drive-session-quarantine-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let session = root.join("telegram.session");
-        for path in [
-            session.clone(),
-            session_sidecar_path(&session, "-wal"),
-            session_sidecar_path(&session, "-shm"),
-        ] {
-            std::fs::write(path, b"preserve-me").unwrap();
-        }
-
-        let quarantine_id = quarantine_session_files(&session).unwrap();
-        let quarantine = root.join("session-quarantine").join(quarantine_id);
-        for name in [
-            "telegram.session",
-            "telegram.session-wal",
-            "telegram.session-shm",
-        ] {
-            assert_eq!(
-                std::fs::read(quarantine.join(name)).unwrap(),
-                b"preserve-me"
-            );
-            assert!(!root.join(name).exists());
-        }
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,10 +1,10 @@
+import i18n from '../../../i18n';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, RotateCcw, Download, Upload, Trash2, HardDrive, Globe, Key, Copy, Check, RefreshCw, FolderArchive, Shield, Zap, Activity, Gauge, Wifi, ChevronDown, Link, Sparkles, Info, Monitor, Loader2, Languages, Play, Palette, Tag, Search, Bug, Database, FolderSync } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
-import { check, Update } from '@tauri-apps/plugin-updater';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { useSupporter } from '../../../context/SupporterContext';
 import { useSettings } from '../../../context/SettingsContext';
 import { useConfirm } from '../../../context/ConfirmContext';
 import { useTranslation } from 'react-i18next';
@@ -14,23 +14,25 @@ import { version as appVersion } from '../../../../package.json';
 import { clearImageMemoryCaches } from '../../../services/imagePreviewCache';
 import { useModalFocus } from '../../../hooks/useModalFocus';
 import { AccessTransparencyDialog, type LocalAccessService } from '../../shared/AccessTransparencyDialog';
-import { installVerifiedUpdate } from '../../../services/updateReliability';
 import { getDetailedTranscodeCache, transcodeCacheErrorMessage } from '../../../services/transcodeCacheClient';
 import { formatBytes } from '../../../utils';
 import { SettingsRow, SettingsStepper, SettingsToggle } from './settings/SettingsControls';
-import { AboutSettingsTab, AdvancedSettingsTab, EncryptionSettingsTab, GeneralSettingsTab, PrivacySettingsTab, ProxySettingsTab, SharingSettingsTab, ThemeSettingsTab, VpnSettingsTab, WebDavSettingsTab } from './settings/SettingsTabs';
+import { AboutSettingsTab, AdvancedSettingsTab, EncryptionSettingsTab, GeneralSettingsTab, LicenseSettingsTab, PrivacySettingsTab, ProxySettingsTab, SharingSettingsTab, ThemeSettingsTab, VpnSettingsTab, WebDavSettingsTab } from './settings/SettingsTabs';
 import { FfmpegInstallNotice } from '../../shared/FfmpegInstallNotice';
 import { SyncSettingsPanel } from '../sync/SyncSettingsPanel';
 import { DesktopBehaviorSettings } from './settings/DesktopBehaviorSettings';
 import { userFacingError } from '../../../services/userFacingError';
-import { getInstallationInfo, RELEASES_URL, type InstallationInfo } from '../../../services/installationInfo';
 import { useActionScope } from '../../../hooks/useActionScope';
+import { useUpdates } from '../../../context/UpdateContext';
+import { BandwidthSettings } from './settings/BandwidthSettings';
+import { applyProxySettings, applyVpnSettings } from '../../../services/networkSettings';
 
 interface SettingsModalProps {
     ownerId: string | null;
     isOpen: boolean;
     onClose: () => void;
     initialTab?: SettingsTab;
+    focusSupporter?: boolean;
 }
 
 interface ApiSettings {
@@ -56,16 +58,20 @@ interface WebDavTokenResponse {
     url: string;
 }
 
-export type SettingsTab = 'general' | 'privacy' | 'advanced' | 'webdav' | 'themes' | 'proxy' | 'vpn' | 'encryption' | 'sharing' | 'sync' | 'about';
+export type SettingsTab = 'general' | 'privacy' | 'license' | 'advanced' | 'webdav' | 'themes' | 'proxy' | 'vpn' | 'encryption' | 'sharing' | 'sync' | 'about';
 
 export function SettingsModal(props: SettingsModalProps) {
     return <OwnedSettingsModal key={props.ownerId ?? 'signed-out'} {...props} />;
 }
 
-function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }: SettingsModalProps) {
-    const { settings, updateSetting, updateSettings, resetSettings } = useSettings();
+function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general', focusSupporter = false }: SettingsModalProps) {
+    const { settings, updateSetting, updateSettings, resetSettings, isLoaded, persistenceStatus } = useSettings();
     const { confirm } = useConfirm();
     const { t } = useTranslation();
+    const { status: supporterStatus } = useSupporter();
+    const tabLabel = (tab: SettingsTab) => tab === 'license'
+        ? t(supporterStatus.ad_free ? 'supporter_license.purchased_title' : 'supporter_license.nav_title')
+        : t(`settings.tab_${tab}`);
     const [clearing, setClearing] = useState(false);
 
     // Transcode cache state
@@ -83,7 +89,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
     const [showGeneralAdvanced, setShowGeneralAdvanced] = useState(false);
     const [accessTransparency, setAccessTransparency] = useState<LocalAccessService | null>(null);
     const modalRef = useRef<HTMLDivElement>(null);
-    useModalFocus(modalRef, onClose, isOpen && !accessTransparency);
+    useModalFocus(modalRef, onClose, isOpen, !!accessTransparency);
     useEffect(() => {
         if (isOpen) {
             setActiveTab(initialTab);
@@ -91,18 +97,43 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
             setAccessTransparency(null);
         }
     }, [initialTab, isOpen]);
+    useEffect(() => {
+        const container = modalRef.current;
+        if (!isOpen || activeTab !== 'license' || !focusSupporter || !container) return;
+        let frame = 0;
+        const focusSection = () => {
+            const section = container.querySelector<HTMLElement>('#desktop-supporter-section');
+            if (!section) return;
+            observer.disconnect();
+            frame = window.requestAnimationFrame(() => {
+                section.scrollIntoView({ block: 'start' });
+                section.focus({ preventScroll: true });
+            });
+        };
+        // The license section is loaded on demand, so it may mount after the tab.
+        const observer = new MutationObserver(focusSection);
+        observer.observe(container, { childList: true, subtree: true });
+        focusSection();
+        return () => { observer.disconnect(); window.cancelAnimationFrame(frame); };
+    }, [activeTab, focusSupporter, isOpen]);
     const [latencyMs, setLatencyMs] = useState<number | null>(null);
     const [vpnDetected, setVpnDetected] = useState<boolean | null>(null);
     const [proxyStatus, setProxyStatus] = useState<{ reachable: boolean; latency_ms: number } | null>(null);
     const [isTestingProxy, setIsTestingProxy] = useState(false);
 
-    // Update check state
-    const [updateChecking, setUpdateChecking] = useState(false);
-    const [updateAvailable, setUpdateAvailable] = useState<Update | null>(null);
-    const [updateVersion, setUpdateVersion] = useState<string | null>(null);
-    const [updateDownloading, setUpdateDownloading] = useState(false);
-    const [updateProgress, setUpdateProgress] = useState(0);
-    const [installationInfo, setInstallationInfo] = useState<InstallationInfo | null>(null);
+    const {
+        checking: updateChecking,
+        available: updateAvailable,
+        version: updateVersion,
+        downloading: updateDownloading,
+        progress: updateProgress,
+        managedByPackageManager,
+        checkForUpdates,
+        downloadAndInstall,
+    } = useUpdates();
+    const [networkApplyFailed, setNetworkApplyFailed] = useState({ proxy: false, vpn: false });
+    const [networkRetry, setNetworkRetry] = useState(0);
+    const networkSettingsReady = isLoaded && persistenceStatus !== 'loading' && persistenceStatus !== 'error';
 
     // Reconnect state
     const [reconnecting, setReconnecting] = useState(false);
@@ -111,54 +142,24 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
     const [diagLoading, setDiagLoading] = useState(false);
 
     const handleCheckForUpdates = useCallback(async () => {
-        setUpdateChecking(true);
-        try {
-            const installation = await getInstallationInfo();
-            setInstallationInfo(installation);
-            const updateInfo = await check();
-            if (updateInfo) {
-                setUpdateAvailable(updateInfo);
-                setUpdateVersion(updateInfo.version);
-                toast.success(t('settings.update_available_toast', { version: updateInfo.version }));
-            } else {
-                setUpdateAvailable(null);
-                setUpdateVersion(null);
-                toast.success(t('settings.latest_version_toast'));
-            }
-        } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (msg.includes('dev') || msg.includes('no current version')) {
+        const result = await checkForUpdates();
+        if (result.error) {
+            if (result.error.includes('dev') || result.error.includes('no current version')) {
                 toast.info(t('settings.update_prod_only_toast'));
             } else {
-                toast.error(t('settings.update_check_failed_toast', { error: msg }));
+                toast.error(t('settings.update_check_failed_toast', { error: result.error }));
             }
-        } finally {
-            setUpdateChecking(false);
+        } else if (result.version) {
+            toast.success(t('settings.update_available_toast', { version: result.version }));
+        } else {
+            toast.success(t('settings.latest_version_toast'));
         }
-    }, [t]);
+    }, [checkForUpdates, t]);
 
     const handleInstallUpdate = useCallback(async () => {
-        if (!updateAvailable) return;
-        if (installationInfo?.managedByPackageManager) {
-            try {
-                await openUrl(RELEASES_URL);
-            } catch (err) {
-                toast.error(t('settings.update_failed_toast', { error: userFacingError(err, t) }));
-            }
-            return;
-        }
-        setUpdateDownloading(true);
-        setUpdateProgress(0);
-        try {
-            await installVerifiedUpdate(updateAvailable, setUpdateProgress, (phase) => {
-                if (phase === 'verifying') toast.info('Verifying the signed update before installation…');
-            });
-        } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            toast.error(t('settings.update_failed_toast', { error: msg }));
-            setUpdateDownloading(false);
-        }
-    }, [installationInfo?.managedByPackageManager, updateAvailable, t]);
+        const result = await downloadAndInstall();
+        if (result.error) toast.error(t('settings.update_failed_toast', { error: result.error }));
+    }, [downloadAndInstall, t]);
 
     // Sharing settings state
     const [shares, setShares] = useState<ShareInfo[]>([]);
@@ -215,7 +216,8 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
         const share = shares.find(s => s.id === id && s.owner_id === ownerId);
         if (!share || !isCurrent()) return;
         
-        let link = `http://127.0.0.1:14201/d/${share.id}`;
+        // The backend builds the loopback link with the port that is really bound.
+        let link = share.link || `http://127.0.0.1:14201/d/${share.id}`;
         if (globalDomain.trim()) {
             link = `http://${globalDomain.trim()}/d/${share.id}`;
         }
@@ -356,63 +358,36 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
         return () => clearInterval(interval);
     }, [isOpen, activeTab, fetchWebDavSettings]);
 
-    // Sync proxy settings to backend whenever they change
+    // Apply only loaded settings; startup defaults must not overwrite native state.
     useEffect(() => {
-        const applyProxy = async () => {
-            try {
-                await invoke('cmd_apply_proxy_settings', {
-                    enabled: settings.proxyEnabled,
-                    proxyType: settings.proxyType,
-                    host: settings.proxyHost,
-                    port: settings.proxyPort,
-                    username: settings.proxyUsername,
-                    password: settings.proxyPassword,
-                });
-            } catch {
-                // best-effort sync
-            }
-        };
-        applyProxy();
+        if (!networkSettingsReady) return;
+        let cancelled = false;
+        void applyProxySettings(settings).then(
+            () => { if (!cancelled) setNetworkApplyFailed(current => ({ ...current, proxy: false })); },
+            () => { if (!cancelled) setNetworkApplyFailed(current => ({ ...current, proxy: true })); },
+        );
+        return () => { cancelled = true; };
     }, [
+        networkSettingsReady, networkRetry,
         settings.proxyEnabled, settings.proxyType, settings.proxyHost,
         settings.proxyPort, settings.proxyUsername, settings.proxyPassword,
     ]);
 
-    // Sync VPN optimizer settings to backend whenever they change
     useEffect(() => {
-        const applyVpn = async () => {
-            try {
-                await invoke('cmd_apply_vpn_settings', {
-                    enabled: settings.vpnMode,
-                    timeoutMultiplier: settings.timeoutMultiplier,
-                    retryAttempts: settings.retryAttempts,
-                    retryBaseBackoffMs: Math.round(settings.retryBaseBackoffSec * 1000),
-                    retryMaxBackoffMs: Math.round(settings.retryMaxBackoffSec * 1000),
-                    adaptivePolling: settings.adaptivePolling,
-                    pollingMinSec: settings.pollingMinSec,
-                    pollingMaxSec: settings.pollingMaxSec,
-                    preferredDc: settings.preferredDC,
-                    dcFallbackAttempts: settings.dcFallbackAttempts,
-                    floodWaitRespect: settings.floodWaitRespect,
-                    peerCacheSize: settings.peerCacheSize,
-                    bandwidthLimitUpKbs: settings.bandwidthLimitUpKBs,
-                    bandwidthLimitDownKbs: settings.bandwidthLimitDownKBs,
-                    chunkSizeKb: settings.chunkSizeKb,
-                    keepAliveIntervalSec: settings.keepAliveIntervalSec,
-                    autoDetectVpn: settings.autoDetectVpn,
-                    archiveMaxBytes: settings.archiveMaxBytes * 1024 * 1024,
-                });
-            } catch {
-                // best-effort sync
-            }
-        };
-        applyVpn();
+        if (!networkSettingsReady) return;
+        let cancelled = false;
+        void applyVpnSettings(settings).then(
+            () => { if (!cancelled) setNetworkApplyFailed(current => ({ ...current, vpn: false })); },
+            () => { if (!cancelled) setNetworkApplyFailed(current => ({ ...current, vpn: true })); },
+        );
+        return () => { cancelled = true; };
     }, [
+        networkSettingsReady, networkRetry,
         settings.vpnMode, settings.timeoutMultiplier, settings.retryAttempts,
         settings.retryBaseBackoffSec, settings.retryMaxBackoffSec, settings.adaptivePolling,
         settings.pollingMinSec, settings.pollingMaxSec, settings.preferredDC,
         settings.dcFallbackAttempts, settings.floodWaitRespect, settings.peerCacheSize,
-        settings.bandwidthLimitUpKBs, settings.bandwidthLimitDownKBs, settings.chunkSizeKb,
+        settings.bandwidthLimitUpKBs, settings.bandwidthLimitDownKBs, settings.bandwidth_schedule, settings.bandwidthWindows, settings.chunkSizeKb,
         settings.keepAliveIntervalSec, settings.autoDetectVpn, settings.archiveMaxBytes,
     ]);
 
@@ -733,7 +708,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                         <div className="flex min-h-16 items-center justify-between border-b border-app-border-subtle px-6 py-4">
                             <div>
                                 <h2 id="settings-dialog-title" className="text-base font-semibold text-app-text">{t('settings.title')}</h2>
-                                <p className="mt-0.5 text-xs text-app-text-tertiary">{activeTab === 'privacy' ? 'Privacy, crash reporting & supporter license' : activeTab === 'advanced' ? 'Advanced connections and integrations' : t(`settings.tab_${activeTab}`)}</p>
+                                <p className="mt-0.5 text-xs text-app-text-tertiary">{tabLabel(activeTab)}</p>
                             </div>
                             <button
                                 onClick={onClose}
@@ -749,24 +724,24 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                         <aside className="w-56 shrink-0 overflow-y-auto border-e border-app-border-subtle bg-app-sidebar p-3">
                             <div className="relative mb-3">
                                 <Search className="pointer-events-none absolute start-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-app-text-tertiary" />
-                                <input value={settingsSearch} onChange={(event) => setSettingsSearch(event.target.value)} placeholder="Search settings" className="quiet-control h-9 w-full border border-app-border bg-app-surface-sunken ps-8 pe-2 text-sm text-app-text outline-none focus:border-app-accent" />
+                                <input value={settingsSearch} onChange={(event) => setSettingsSearch(event.target.value)} placeholder={i18n.t('ui_copy.search_settings')} className="quiet-control h-9 w-full border border-app-border bg-app-surface-sunken ps-8 pe-2 text-sm text-app-text outline-none focus:border-app-accent" />
                             </div>
                             {([
-                                ['Essentials', [['general', Globe, 'General transfers language updates'], ['themes', Palette, 'Appearance colors themes']] as const],
-                                ['Security & Privacy', [['privacy', Bug, 'Privacy telemetry crash reports consent supporter lifetime ad-free ads $5 PayPal recovery'], ['encryption', Shield, 'Encryption vault security auto lock']] as const],
-                                ['Connections', [['sync', FolderSync, 'Folder sync local directories Telegram channels'], ['sharing', Link, 'Sharing links local server']] as const],
-                                ['Advanced', [['advanced', Gauge, 'REST API proxy VPN WebDAV network integration Finder token port']] as const],
-                                ['Support', [['about', Info, 'About diagnostics version updates']] as const],
+                                [t('ui_copy.nav_essentials'), [['general', Globe, 'General transfers language updates'], ['themes', Palette, 'Appearance colors themes']] as const],
+                                [t('ui_copy.nav_security'), [['privacy', Bug, 'Privacy telemetry crash reports consent'], ['encryption', Shield, 'Encryption vault security auto lock']] as const],
+                                [t('ui_copy.nav_connections'), [['sync', FolderSync, 'Folder sync local directories Telegram channels'], ['sharing', Link, 'Sharing links local server']] as const],
+                                [t('settings.tab_advanced'), [['advanced', Gauge, 'REST API proxy VPN WebDAV network integration Finder token port']] as const],
+                                [t('ui_copy.nav_support'), [['license', Key, 'Supporter lifetime license ad-free ads $5 PayPal recovery purchase'], ['about', Info, 'About diagnostics version updates']] as const],
                             ] as const).map(([group, items]) => {
-                                const visibleItems = items.filter(([key, , keywords]) => `${key} ${keywords}`.toLowerCase().includes(settingsSearch.trim().toLowerCase()));
+                                const visibleItems = items.filter(([key, , keywords]) => `${key} ${keywords} ${tabLabel(key)}`.toLowerCase().includes(settingsSearch.trim().toLowerCase()));
                                 if (visibleItems.length === 0) return null;
                                 return (
                                     <div key={group} className="mb-3">
                                         <div className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-wider text-app-text-tertiary">{group}</div>
                                         {visibleItems.map(([key, Icon]) => (
                                             <button key={key} onClick={() => setActiveTab(key)} className={`quiet-control mb-0.5 flex w-full items-center gap-2.5 px-3 py-2 text-start text-sm font-medium ${activeTab === key ? 'bg-app-selected text-app-text' : 'text-app-text-secondary hover:text-app-text'}`}>
-                                                <Icon className={`h-4 w-4 ${activeTab === key ? 'text-app-accent' : ''}`} />
-                                                {key === 'privacy' ? 'Privacy' : key === 'advanced' ? 'Advanced' : t(`settings.tab_${key}`)}
+                                                <Icon className={`h-4 w-4 shrink-0 ${activeTab === key ? 'text-app-accent' : ''}`} />
+                                                {tabLabel(key)}
                                             </button>
                                         ))}
                                     </div>
@@ -776,13 +751,19 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
 
                         {/* Body */}
                         <div className="relative min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-7 py-6">
+                            {((activeTab === 'proxy' && networkApplyFailed.proxy) || (activeTab === 'vpn' && networkApplyFailed.vpn)) && (
+                                <div role="alert" className="mb-4 flex items-center justify-between gap-3 rounded-lg border border-app-danger/30 p-3 text-sm text-app-text">
+                                    <span>{t('common.operation_failed')}</span>
+                                    <button type="button" onClick={() => setNetworkRetry(value => value + 1)} className="quiet-control px-3 py-1.5">{t('common.retry')}</button>
+                                </div>
+                            )}
                             <AnimatePresence mode="wait" initial={false}>
 
                                 {activeTab === 'general' && (
                                     <GeneralSettingsTab>
 
                             {/* Transfers Section */}
-                            <section className="space-y-3">
+                            <section className="settings-group">
                                 <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
                                     <Upload className="w-3.5 h-3.5" />
                                     {t('settings.transfers')}
@@ -813,13 +794,15 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                             value={settings.videoUploadMode}
                                             onChange={event => updateSetting('videoUploadMode', event.target.value as 'file' | 'media')}
                                             aria-label={t('settings.video_upload_default')}
-                                            className="rounded-md border border-telegram-border bg-telegram-bg px-2.5 py-1.5 text-sm text-telegram-text focus:border-telegram-primary/50 focus:outline-none"
+                                            className="settings-select"
                                         >
                                             <option value="file">{t('settings.video_upload_file')}</option>
                                             <option value="media">{t('settings.video_upload_media')}</option>
                                         </select>
                                     )}
                                 />
+
+                                <SettingsRow icon={<Play className="h-4 w-4" />} title={t('settings.videoFilenameCaption')} description={t('settings.videoFilenameCaptionDesc')} control={<SettingsToggle checked={settings.videoFilenameCaption} label={t('settings.videoFilenameCaption')} onChange={() => updateSetting('videoFilenameCaption', !settings.videoFilenameCaption)} />} />
 
                                 <SettingsRow icon={<Tag className="h-4 w-4 text-telegram-subtext" />} title={t('common.hide_groups')} description={t('common.hide_groups_desc')} control={<SettingsToggle checked={settings.hideGroups} label={t('common.hide_groups')} onChange={() => updateSetting('hideGroups', !settings.hideGroups)} />} />
 
@@ -865,7 +848,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                             </section>
 
                             {!showGeneralAdvanced && (
-                                <button type="button" onClick={() => setActiveTab('advanced')} className="quiet-surface flex w-full items-center justify-between p-4 text-start hover:border-app-accent/30 hover:bg-app-hover"><span><strong className="block text-sm text-app-text">Advanced settings</strong><span className="mt-1 block text-xs text-app-text-secondary">REST API, WebDAV, proxy, VPN, and network tuning</span></span><Gauge className="h-5 w-5 text-app-accent" /></button>
+                                <button type="button" onClick={() => setActiveTab('advanced')} className="quiet-surface flex w-full items-center justify-between p-4 text-start hover:border-app-accent/30 hover:bg-app-hover"><span><strong className="block text-sm text-app-text">{i18n.t('ui_copy.advanced_settings')}</strong><span className="mt-1 block text-xs text-app-text-secondary">REST API, WebDAV, proxy, VPN, and network tuning</span></span><Gauge className="h-5 w-5 text-app-accent" /></button>
                             )}
 
                             {/* REST API Section */}
@@ -914,6 +897,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                             type="number"
                                             min="1024"
                                             max="65535"
+                                            aria-label={t('common.port')}
                                             value={apiPort}
                                             onChange={e => setApiPort(e.target.value)}
                                             onBlur={handlePortApply}
@@ -965,7 +949,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                         </div>
                                     )}
                                 </div>
-                                <button type="button" onClick={() => setAccessTransparency('rest')} className="quiet-control flex w-full items-center justify-center gap-2 border border-app-border-subtle px-3 py-2 text-xs font-medium text-app-accent"><Info className="h-3.5 w-3.5" aria-hidden="true" />Understand REST permissions</button>
+                                <button type="button" onClick={() => setAccessTransparency('rest')} className="quiet-control flex w-full items-center justify-center gap-2 border border-app-border-subtle px-3 py-2 text-xs font-medium text-app-accent"><Info className="h-3.5 w-3.5" aria-hidden="true" />{t('access_copy.rest_open')}</button>
                             </section>
 
                             {/* Storage Section */}
@@ -1001,7 +985,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                     <div className="flex min-w-0 items-center gap-2">
                                         <Database className="h-4 w-4 shrink-0 text-telegram-subtext" />
                                         <div className="min-w-0">
-                                            <p className="text-sm font-medium text-telegram-text">{t('settings.offline_cache')}</p>
+                                            <p className="text-sm font-medium text-telegram-text">{t('common.offline_files')}</p>
                                             <p className="text-xs text-telegram-subtext">{t('settings.offline_cache_desc')}</p>
                                             <p className="mt-1 text-xs font-mono text-telegram-primary">
                                                 {offlineCacheError
@@ -1263,7 +1247,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-telegram-primary text-white hover:bg-telegram-primary/90 transition"
                                             >
                                                 <Download className="w-3 h-3" />
-                                                {installationInfo?.managedByPackageManager ? t('common.open') : t('settings.update_restart')}
+                                                {managedByPackageManager ? t('files.open') : t('settings.update_restart')}
                                             </button>
                                         ) : updateDownloading ? (
                                             <div className="flex items-center gap-2">
@@ -1294,6 +1278,8 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
 
                                     </GeneralSettingsTab>
                                 )}
+
+                                {activeTab === 'license' && <LicenseSettingsTab />}
 
                                 {activeTab === 'privacy' && (
                                     <PrivacySettingsTab
@@ -1339,12 +1325,12 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                                 {settings.proxyEnabled && (
                                                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-telegram-subtext font-mono">
                                                         {!settings.proxyLiveStateEnabled
-                                                            ? t('settings.proxy_status_off') || 'Off'
+                                                            ? t('settings.proxy_status_off') || i18n.t("settings.off")
                                                             : !proxyStatus 
-                                                                ? t('settings.proxy_status_checking') || 'Checking…' 
+                                                                ? t('settings.checking')
                                                                 : proxyStatus.reachable 
-                                                                    ? `${t('settings.proxy_status_connected') || 'Connected'} (${proxyStatus.latency_ms}ms)` 
-                                                                    : t('settings.proxy_status_unreachable') || 'Unreachable'}
+                                                                    ? `${t('settings.proxy_status_connected')} (${proxyStatus.latency_ms}ms)`
+                                                                    : t('settings.proxy_status_unreachable')}
                                                     </span>
                                                 )}
                                             </div>
@@ -1364,8 +1350,8 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                 {settings.proxyEnabled && (
                                     <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
                                         <div>
-                                            <p className="text-sm text-telegram-text font-medium">{t('settings.live_state') || 'Live Connection Monitoring'}</p>
-                                            <p className="text-xs text-telegram-subtext">{t('settings.live_state_desc') || 'Periodically check connectivity and display latency'}</p>
+                                            <p className="text-sm text-telegram-text font-medium">{t('settings.live_state')}</p>
+                                            <p className="text-xs text-telegram-subtext">{t('settings.live_state_desc')}</p>
                                         </div>
                                         <button
                                             type="button" role="switch" aria-checked={settings.proxyLiveStateEnabled} aria-label={t('settings.live_state')}
@@ -1384,7 +1370,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                         <p className="text-xs text-telegram-subtext">
                                             {settings.proxyType === 'socks5' 
                                                 ? t('settings.socks5_desc') 
-                                                : t('settings.http_bridge_desc') || 'HTTP/HTTPS proxy tunneling via local SOCKS5 bridge.'}
+                                                : t('settings.http_bridge_desc')}
                                         </p>
                                     </div>
                                     <div className="relative">
@@ -1427,7 +1413,8 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                         type="number"
                                         min="1"
                                         max="65535"
-                                        value={settings.proxyPort}
+                                        aria-label={t('common.port')}
+                                                value={settings.proxyPort}
                                         onChange={e => updateSetting('proxyPort', Math.max(1, Math.min(65535, parseInt(e.target.value) || 1080)))}
                                         className="w-20 bg-telegram-bg border border-telegram-border rounded-md px-2 py-1 text-sm text-telegram-text text-center focus:outline-none focus:border-telegram-primary/50 transition"
                                     />
@@ -1522,9 +1509,9 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                                 try {
                                                     const success = await invoke<boolean>('cmd_test_proxy_traffic');
                                                     if (success) {
-                                                        toast.success(t('settings.proxy_test_success') || 'Proxy connection working!');
+                                                        toast.success(t('settings.proxy_test_success'));
                                                     } else {
-                                                        toast.error(t('settings.proxy_test_failed') || 'Proxy traffic test failed.');
+                                                        toast.error(t('settings.proxy_test_failed'));
                                                     }
                                                 } catch (e) {
                                                     toast.error(`Error testing proxy: ${e}`);
@@ -1538,12 +1525,12 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                             {isTestingProxy ? (
                                                 <>
                                                     <Loader2 className="w-3 h-3 animate-spin" />
-                                                    {t('settings.proxy_testing') || 'Testing…'}
+                                                    {t('settings.proxy_testing')}
                                                 </>
                                             ) : (
                                                 <>
                                                     <Play className="w-3.5 h-3.5" />
-                                                    {t('settings.test_connection') || 'Test Connection'}
+                                                    {t('settings.test_connection')}
                                                 </>
                                             )}
                                         </button>
@@ -1565,7 +1552,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                             'bg-red-500/10 text-red-400'
                                         }`}>
                                             <Activity className="w-3 h-3 inline mr-0.5" />
-                                            {latencyMs < 0 ? 'Offline' : `${latencyMs}ms`}
+                                            {latencyMs < 0 ? i18n.t("settings.offline") : `${latencyMs}ms`}
                                         </span>
                                     )}
                                 </h3>
@@ -1587,6 +1574,8 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                         <span className={`absolute top-0.5 start-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${settings.vpnMode ? 'translate-x-5 rtl:-translate-x-5' : 'translate-x-0'}`} />
                                     </button>
                                 </div>
+
+                                <BandwidthSettings />
 
                                 {settings.vpnMode && (<>
                                     {/* Timeout Multiplier */}
@@ -1638,41 +1627,6 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                             aria-label={t('settings.max_delay')}
                                             onChange={e => updateSetting('retryMaxBackoffSec', parseInt(e.target.value))}
                                             className="w-full h-1.5 rounded-full appearance-none bg-telegram-border accent-telegram-primary cursor-pointer" />
-                                    </div>
-
-                                    {/* Adaptive Polling */}
-                                    <div className="p-3 rounded-lg bg-telegram-hover/50 space-y-2">
-                                        <div className="flex items-center justify-between">
-                                            <div>
-                                                <p className="text-sm text-telegram-text font-medium">{t('settings.adaptive_polling')}</p>
-                                                <p className="text-xs text-telegram-subtext">{t('settings.adaptive_polling_desc')}</p>
-                                            </div>
-                                            <button
-                                                type="button" role="switch" aria-checked={settings.adaptivePolling} aria-label={t('settings.adaptive_polling')}
-                                                onClick={() => updateSetting('adaptivePolling', !settings.adaptivePolling)}
-                                                className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${settings.adaptivePolling ? 'bg-telegram-primary' : 'bg-telegram-border'}`}
-                                            >
-                                                <span className={`absolute top-0.5 start-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${settings.adaptivePolling ? 'translate-x-5 rtl:-translate-x-5' : 'translate-x-0'}`} />
-                                            </button>
-                                        </div>
-                                        {settings.adaptivePolling && (<>
-                                            <div className="flex items-center justify-between">
-                                                <p className="text-xs text-telegram-subtext">{t('settings.min_interval')}</p>
-                                                <span className="text-xs text-telegram-primary font-mono">{settings.pollingMinSec}s</span>
-                                            </div>
-                                            <input type="range" min="10" max="30" step="5" value={settings.pollingMinSec}
-                                                aria-label={t('settings.min_interval')}
-                                                onChange={e => updateSetting('pollingMinSec', parseInt(e.target.value))}
-                                                className="w-full h-1.5 rounded-full appearance-none bg-telegram-border accent-telegram-primary cursor-pointer" />
-                                            <div className="flex items-center justify-between">
-                                                <p className="text-xs text-telegram-subtext">{t('settings.max_interval')}</p>
-                                                <span className="text-xs text-telegram-primary font-mono">{settings.pollingMaxSec}s</span>
-                                            </div>
-                                            <input type="range" min="45" max="120" step="15" value={settings.pollingMaxSec}
-                                                aria-label={t('settings.max_interval')}
-                                                onChange={e => updateSetting('pollingMaxSec', parseInt(e.target.value))}
-                                                className="w-full h-1.5 rounded-full appearance-none bg-telegram-border accent-telegram-primary cursor-pointer" />
-                                        </>)}
                                     </div>
 
                                     {/* Preferred DC */}
@@ -1727,49 +1681,6 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                         >
                                             <span className={`absolute top-0.5 start-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${settings.floodWaitRespect ? 'translate-x-5 rtl:-translate-x-5' : 'translate-x-0'}`} />
                                         </button>
-                                    </div>
-
-                                    {/* Peer Cache Size */}
-                                    <div className="p-3 rounded-lg bg-telegram-hover/50 space-y-2">
-                                        <div className="flex items-center justify-between">
-                                            <div>
-                                                <p className="text-sm text-telegram-text font-medium">{t('settings.peer_cache_size')}</p>
-                                                <p className="text-xs text-telegram-subtext">{t('settings.peer_cache_desc')}</p>
-                                            </div>
-                                            <span className="text-sm text-telegram-primary font-mono font-medium">{settings.peerCacheSize}</span>
-                                        </div>
-                                        <input type="range" min="100" max="2000" step="100" value={settings.peerCacheSize}
-                                            aria-label={t('settings.peer_cache_size')}
-                                            onChange={e => updateSetting('peerCacheSize', parseInt(e.target.value))}
-                                            className="w-full h-1.5 rounded-full appearance-none bg-telegram-border accent-telegram-primary cursor-pointer" />
-                                    </div>
-
-                                    {/* Bandwidth Throttle */}
-                                    <div className="p-3 rounded-lg bg-telegram-hover/50 space-y-2">
-                                        <p className="text-sm text-telegram-text font-medium flex items-center gap-1.5">
-                                            <Gauge className="w-3.5 h-3.5 text-telegram-subtext" />
-                                            {t('settings.bandwidth_throttle')}
-                                        </p>
-                                        <div className="flex items-center justify-between">
-                                            <p className="text-xs text-telegram-subtext">{t('settings.upload_limit')}</p>
-                                            <span className="text-xs text-telegram-primary font-mono">
-                                                {settings.bandwidthLimitUpKBs === 0 ? t('settings.unlimited') : `${settings.bandwidthLimitUpKBs} KB/s`}
-                                            </span>
-                                        </div>
-                                        <input type="range" min="0" max="5120" step="128" value={settings.bandwidthLimitUpKBs}
-                                            aria-label={t('settings.upload_limit')}
-                                            onChange={e => updateSetting('bandwidthLimitUpKBs', parseInt(e.target.value))}
-                                            className="w-full h-1.5 rounded-full appearance-none bg-telegram-border accent-telegram-primary cursor-pointer" />
-                                        <div className="flex items-center justify-between">
-                                            <p className="text-xs text-telegram-subtext">{t('settings.download_limit')}</p>
-                                            <span className="text-xs text-telegram-primary font-mono">
-                                                {settings.bandwidthLimitDownKBs === 0 ? t('settings.unlimited') : `${settings.bandwidthLimitDownKBs} KB/s`}
-                                            </span>
-                                        </div>
-                                        <input type="range" min="0" max="5120" step="128" value={settings.bandwidthLimitDownKBs}
-                                            aria-label={t('settings.download_limit')}
-                                            onChange={e => updateSetting('bandwidthLimitDownKBs', parseInt(e.target.value))}
-                                            className="w-full h-1.5 rounded-full appearance-none bg-telegram-border accent-telegram-primary cursor-pointer" />
                                     </div>
 
                                     {/* Chunk Size */}
@@ -1827,7 +1738,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                             className="w-full h-1.5 rounded-full appearance-none bg-telegram-border accent-telegram-primary cursor-pointer" />
                                     </div>
 
-                                    {/* Auto-Detect VPN */}
+                                    {/* VPN detection status (the diagnostic runs when this tab opens). */}
                                     <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
                                         <div className="flex items-center gap-2">
                                             <Wifi className="w-4 h-4 text-telegram-subtext" />
@@ -1838,13 +1749,6 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                                 </p>
                                             </div>
                                         </div>
-                                        <button
-                                            type="button" role="switch" aria-checked={settings.autoDetectVpn} aria-label={t('settings.auto_detect_vpn')}
-                                            onClick={() => updateSetting('autoDetectVpn', !settings.autoDetectVpn)}
-                                            className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${settings.autoDetectVpn ? 'bg-telegram-primary' : 'bg-telegram-border'}`}
-                                        >
-                                            <span className={`absolute top-0.5 start-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${settings.autoDetectVpn ? 'translate-x-5 rtl:-translate-x-5' : 'translate-x-0'}`} />
-                                        </button>
                                     </div>
                                 </>)}
                                     </VpnSettingsTab>
@@ -1861,7 +1765,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                                 <p className="mt-2 text-xs leading-relaxed text-telegram-subtext"><strong className="text-telegram-text">Use WebDAV, not SMB.</strong> Connect with the complete generated <code>/dav/&lt;token&gt;/</code> URL. Finder's Guest/anonymous login has no token and will show an empty location; no guest account is created.</p>
                                             </div>
                                         </div>
-                                        <button type="button" onClick={() => setAccessTransparency('webdav')} className="quiet-control flex w-full items-center justify-center gap-2 border border-app-border-subtle px-3 py-2 text-xs font-medium text-app-accent"><Info className="h-3.5 w-3.5" aria-hidden="true" />Understand WebDAV permissions</button>
+                                        <button type="button" onClick={() => setAccessTransparency('webdav')} className="quiet-control flex w-full items-center justify-center gap-2 border border-app-border-subtle px-3 py-2 text-xs font-medium text-app-accent"><Info className="h-3.5 w-3.5" aria-hidden="true" />{t('access_copy.webdav_open')}</button>
 
                                         {!webDavSettings.supported ? (
                                             <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-4 text-sm text-amber-300">
@@ -1882,7 +1786,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                                             <p className="text-sm font-medium text-telegram-text">{t('settings.enable_webdav')}</p>
                                                             <p className="text-xs text-telegram-subtext">
                                                                 {webDavSettings.running
-                                                                    ? t('settings.webdav_running', { port: webDavSettings.port })
+                                                                    ? t('settings.api_running', { port: webDavSettings.port })
                                                                     : t('settings.webdav_stopped')}
                                                             </p>
                                                         </div>
@@ -2120,7 +2024,7 @@ function OwnedSettingsModal({ ownerId, isOpen, onClose, initialTab = 'general' }
                                                 await navigator.clipboard.writeText(diagnostics);
                                                 toast.success(t('settings.diagnostics_copied'));
                                             } catch (error) {
-                                                toast.error(t('settings.diagnostics_copy_failed', { error }));
+                                                toast.error(t('settings.failed_prefix', { error }));
                                             } finally {
                                                 setDiagLoading(false);
                                             }

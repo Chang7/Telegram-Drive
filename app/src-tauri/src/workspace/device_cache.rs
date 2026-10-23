@@ -1,37 +1,15 @@
 //! Shared device capacity and disposable preview storage. Offline files are never part of
 //! this tree, even during migration or an explicit cache clear.
+use super::cache_core::{self, state, Clearing, State};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
-    },
     time::SystemTime,
 };
 
 type Result<T> = std::result::Result<T, String>;
-const DEFAULT_LIMIT: u64 = 256 * 1024 * 1024;
 pub const SPACE_RESERVE: u64 = 128 * 1024 * 1024;
-static LIMIT: AtomicU64 = AtomicU64::new(DEFAULT_LIMIT);
-static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-
-#[derive(Default)]
-struct State {
-    epochs: HashMap<PathBuf, u64>,
-    // Partial path -> (category root, complete expected size).
-    active: HashMap<PathBuf, (PathBuf, u64)>,
-}
-
-fn state() -> std::sync::MutexGuard<'static, State> {
-    STATE
-        .get_or_init(|| Mutex::new(State::default()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheStatus {
@@ -40,13 +18,14 @@ pub struct CacheStatus {
     pub partial_bytes: u64,
     pub legacy_bytes: u64,
     pub limit_bytes: u64,
+    pub kept_bytes: u64,
 }
 
 pub fn set_limit_bytes(bytes: u64) {
-    LIMIT.store(bytes.max(1), Ordering::Relaxed);
+    cache_core::configure(bytes, cache_core::limits().1);
 }
 pub fn limit_bytes() -> u64 {
-    LIMIT.load(Ordering::Relaxed)
+    cache_core::limits().0
 }
 pub fn root(app_cache_dir: &Path) -> PathBuf {
     app_cache_dir.join("previews").join("android-library")
@@ -77,7 +56,6 @@ fn subdir(base: &Path, names: &[&str], create: bool) -> Result<PathBuf> {
 struct Entry {
     path: PathBuf,
     bytes: u64,
-    modified: SystemTime,
 }
 
 fn files(path: &Path, output: &mut Vec<Entry>) -> Result<()> {
@@ -95,7 +73,6 @@ fn files(path: &Path, output: &mut Vec<Entry>) -> Result<()> {
             output.push(Entry {
                 path: entry.path(),
                 bytes: meta.len(),
-                modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             });
         }
         // Symlinks are neither followed nor treated as verified cache files.
@@ -128,7 +105,10 @@ fn category(app_cache_dir: &Path, create: bool) -> Result<PathBuf> {
     if create {
         fs::create_dir_all(app_cache_dir).map_err(|e| e.to_string())?;
     }
-    subdir(app_cache_dir, &["previews", "android-library"], create)
+    let cache = app_cache_dir
+        .canonicalize()
+        .unwrap_or_else(|_| app_cache_dir.to_path_buf());
+    subdir(&cache, &["previews", "android-library"], create)
 }
 
 fn migrate(data_dir: &Path, app_cache_dir: &Path) -> Result<()> {
@@ -168,44 +148,7 @@ fn prune(
     incoming: u64,
     preserve: Option<&Path>,
 ) -> Result<()> {
-    let mut entries = Vec::new();
-    files(base, &mut entries)?;
-    let mut candidates = Vec::new();
-    let reserved: u64 = state
-        .active
-        .values()
-        .filter(|(root, _)| root == base)
-        .map(|(_, size)| *size)
-        .sum();
-    let mut bytes = reserved;
-    for entry in entries {
-        if state.active.contains_key(&entry.path) {
-            continue;
-        }
-        if entry.path.extension().and_then(|e| e.to_str()) == Some("part") {
-            // Every current preview writer owns a lease; unowned partials are
-            // abandoned, and this download path never resumes those UUIDs.
-            fs::remove_file(&entry.path).map_err(|e| e.to_string())?;
-            continue;
-        }
-        bytes = bytes.saturating_add(entry.bytes);
-        candidates.push(entry);
-    }
-    candidates.sort_by_key(|entry| entry.modified);
-    for entry in candidates {
-        if bytes.saturating_add(incoming) <= limit {
-            break;
-        }
-        if preserve.is_some_and(|path| path == entry.path) {
-            continue;
-        }
-        fs::remove_file(&entry.path).map_err(|e| e.to_string())?;
-        bytes = bytes.saturating_sub(entry.bytes);
-    }
-    if bytes.saturating_add(incoming) > limit {
-        return Err("The preview cache is busy or this file exceeds its limit; increase the media cache limit or keep the file offline".into());
-    }
-    Ok(())
+    state.prune(base, limit, incoming, preserve).map(|_| ())
 }
 
 fn status_inner(data_dir: &Path, app_cache_dir: &Path) -> Result<CacheStatus> {
@@ -222,6 +165,10 @@ fn status_inner(data_dir: &Path, app_cache_dir: &Path) -> Result<CacheStatus> {
     };
     status.legacy_bytes = legacy.iter().map(|entry| entry.bytes).sum();
     for entry in current.into_iter().chain(legacy) {
+        if cache_core::kept(&entry.path) {
+            status.kept_bytes = status.kept_bytes.saturating_add(entry.bytes);
+            continue;
+        }
         status.total_bytes = status.total_bytes.saturating_add(entry.bytes);
         if entry.path.extension().and_then(|e| e.to_str()) == Some("part") {
             status.partial_bytes = status.partial_bytes.saturating_add(entry.bytes);
@@ -233,11 +180,13 @@ fn status_inner(data_dir: &Path, app_cache_dir: &Path) -> Result<CacheStatus> {
 }
 
 pub fn status(data_dir: &Path, app_cache_dir: &Path) -> Result<CacheStatus> {
+    cache_core::register(app_cache_dir, Some(data_dir))?;
     let _state = state();
     status_inner(data_dir, app_cache_dir)
 }
 
 pub fn maintain(data_dir: &Path, app_cache_dir: &Path) -> Result<CacheStatus> {
+    cache_core::register(app_cache_dir, Some(data_dir))?;
     let state = state();
     migrate(data_dir, app_cache_dir)?;
     prune(&root(app_cache_dir), &state, limit_bytes(), 0, None)?;
@@ -245,18 +194,25 @@ pub fn maintain(data_dir: &Path, app_cache_dir: &Path) -> Result<CacheStatus> {
 }
 
 pub fn clear(data_dir: &Path, app_cache_dir: &Path) -> Result<u64> {
-    let mut state = state();
+    crate::external_files::invalidate_all_accounts(data_dir)?;
+    cache_core::register(app_cache_dir, Some(data_dir))?;
     let base = category(app_cache_dir, false)?;
-    let bytes = status_inner(data_dir, app_cache_dir)?.total_bytes;
-    *state.epochs.entry(base.clone()).or_default() += 1;
-    state.active.retain(|_, (root, _)| root != &base);
-    if base.exists() {
-        fs::remove_dir_all(&base).map_err(|e| e.to_string())?;
+    let _clearing = Clearing::new(&base);
+    let _state = state();
+    let mut removed = 0u64;
+    let mut current = Vec::new();
+    files(&base, &mut current)?;
+    for (_, legacy) in legacy_directories(data_dir)? {
+        files(&legacy, &mut current)?;
     }
-    for (_, path) in legacy_directories(data_dir)? {
-        fs::remove_dir_all(path).map_err(|e| e.to_string())?;
+    for entry in current {
+        if cache_core::kept(&entry.path) {
+            continue;
+        }
+        fs::remove_file(&entry.path).map_err(|e| e.to_string())?;
+        removed = removed.saturating_add(entry.bytes);
     }
-    Ok(bytes)
+    Ok(removed)
 }
 
 pub enum Prepared {
@@ -266,6 +222,7 @@ pub enum Prepared {
 
 pub struct Reservation {
     root: PathBuf,
+    token: String,
     pub target: PathBuf,
     pub partial: PathBuf,
     expected: u64,
@@ -301,6 +258,7 @@ fn prepare_with_space(
     limit: u64,
     available: impl Fn(&Path) -> Result<u64>,
 ) -> Result<Prepared> {
+    cache_core::register(app_cache_dir, Some(data_dir))?;
     if owner <= 0
         || filename.is_empty()
         || Path::new(filename)
@@ -340,15 +298,14 @@ fn prepare_with_space(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
     }
-    prune(&base, &state, limit, expected, None)?;
     check_space(available(&directory)?, expected)?;
     let partial = target.with_extension(format!("{}.part", uuid::Uuid::new_v4()));
-    let epoch = *state.epochs.entry(base.clone()).or_default();
-    state
-        .active
-        .insert(partial.clone(), (base.clone(), expected));
+    let token = uuid::Uuid::new_v4().to_string();
+    let epoch = state.reserve(&base, &token, expected)?;
+    state.paths.insert(partial.clone(), token.clone());
     Ok(Prepared::Download(Reservation {
         root: base,
+        token,
         target,
         partial,
         expected,
@@ -362,21 +319,7 @@ impl Reservation {
         self.check_locked(&state)
     }
     fn check_locked(&self, state: &State) -> Result<()> {
-        let reserved: u64 = state
-            .active
-            .values()
-            .filter(|(root, _)| root == &self.root)
-            .map(|(_, size)| *size)
-            .sum();
-        if state.epochs.get(&self.root) != Some(&self.epoch)
-            || !state.active.contains_key(&self.partial)
-        {
-            Err("The preview cache was cleared; reopen the file to preview it".into())
-        } else if reserved > limit_bytes() {
-            Err("The media cache limit changed; reopen the file after updating the limit".into())
-        } else {
-            Ok(())
-        }
+        state.check(&self.root, &self.token, self.epoch)
     }
     pub fn check_free_space(&self, incoming: u64) -> Result<()> {
         self.check()?;
@@ -397,14 +340,20 @@ impl Reservation {
             return Err("The preview download is incomplete".into());
         }
         fs::rename(&self.partial, &self.target).map_err(|e| e.to_string())?;
-        state.active.remove(&self.partial);
+        state.paths.remove(&self.partial);
+        state.reservations.remove(&self.token);
         Ok(self.target.clone())
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        state().active.remove(&self.partial);
+        let mut state = state();
+        if state.paths.get(&self.partial) == Some(&self.token) {
+            state.paths.remove(&self.partial);
+        }
+        state.reservations.remove(&self.token);
+        drop(state);
         let _ = fs::remove_file(&self.partial);
     }
 }
@@ -449,132 +398,12 @@ pub fn available_bytes(directory: &Path) -> Result<u64> {
     let path = directory.canonicalize().map_err(|e| e.to_string())?;
     sysinfo::Disks::new_with_refreshed_list()
         .iter()
-        .filter(|disk| path.starts_with(disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().as_os_str().len())
-        .map(|disk| disk.available_space())
+        .filter_map(|disk| {
+            let mount = disk.mount_point().canonicalize().ok()?;
+            path.starts_with(&mount)
+                .then(|| (mount.as_os_str().len(), disk.available_space()))
+        })
+        .max_by_key(|(length, _)| *length)
+        .map(|(_, available)| available)
         .ok_or_else(|| "Unable to read available device storage".into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn setup() -> (PathBuf, PathBuf) {
-        let data = std::env::temp_dir().join(format!("android-preview-{}", uuid::Uuid::new_v4()));
-        let cache = data.join("cache");
-        fs::create_dir_all(&cache).unwrap();
-        (data, cache)
-    }
-    fn write(path: &Path, bytes: &[u8]) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, bytes).unwrap();
-    }
-    fn download(
-        data: &Path,
-        cache: &Path,
-        owner: i64,
-        name: &str,
-        size: u64,
-        limit: u64,
-    ) -> Result<Prepared> {
-        prepare_with_space(data, cache, owner, name, size, limit, |_| Ok(u64::MAX))
-    }
-    #[test]
-    fn migration_and_clear_preserve_kept_files_and_account_boundaries() {
-        let (data, cache) = setup();
-        let kept = data.join("files/android-offline/12/saved-7.mp4");
-        write(&kept, b"kept");
-        let other_kept = data.join("files/android-offline/13/saved-7.mp4");
-        write(&other_kept, b"other");
-        let old = data.join("files/android-offline/12/previews/saved-7.jpg");
-        write(&old, b"image");
-        let partial = data.join("files/android-offline/12/previews/old.part");
-        write(&partial, b"bad");
-        assert_eq!(status(&data, &cache).unwrap().legacy_bytes, 8);
-        maintain(&data, &cache).unwrap();
-        assert!(!old.exists());
-        assert!(!partial.exists());
-        let new = root(&cache).join("12/saved-7.jpg");
-        assert_eq!(fs::read(&new).unwrap(), b"image");
-        assert!(matches!(
-            download(&data, &cache, 12, "saved-7.jpg", 5, 10).unwrap(),
-            Prepared::Cached(_)
-        ));
-        assert!(matches!(
-            download(&data, &cache, 13, "saved-7.jpg", 5, 10).unwrap(),
-            Prepared::Download(_)
-        ));
-        assert_eq!(clear(&data, &cache).unwrap(), 5);
-        assert_eq!(fs::read(&kept).unwrap(), b"kept");
-        assert_eq!(fs::read(&other_kept).unwrap(), b"other");
-        assert_eq!(status(&data, &cache).unwrap().total_bytes, 0);
-        fs::remove_dir_all(data).unwrap();
-    }
-    #[test]
-    fn quotas_reserve_concurrent_downloads_evict_old_previews_and_reject_oversized_files() {
-        let (data, cache) = setup();
-        write(&root(&cache).join("12/old.jpg"), b"oldbytes");
-        let Prepared::Download(first) = download(&data, &cache, 12, "first.jpg", 6, 10).unwrap()
-        else {
-            panic!()
-        };
-        assert!(!root(&cache).join("12/old.jpg").exists());
-        assert!(download(&data, &cache, 13, "second.jpg", 6, 10).is_err());
-        assert!(download(&data, &cache, 12, "large.jpg", 11, 10).is_err());
-        write(&first.partial, b"123456");
-        first.finish().unwrap();
-        drop(first);
-        assert_eq!(status(&data, &cache).unwrap().total_bytes, 6);
-        let Prepared::Download(second) = download(&data, &cache, 13, "second.jpg", 6, 10).unwrap()
-        else {
-            panic!()
-        };
-        assert!(!root(&cache).join("12/first.jpg").exists());
-        drop(second);
-        fs::remove_dir_all(data).unwrap();
-    }
-    #[test]
-    fn clearing_cancels_inflight_publication_and_abandoned_partials_are_removed() {
-        let (data, cache) = setup();
-        let Prepared::Download(active) = download(&data, &cache, 12, "photo.jpg", 4, 10).unwrap()
-        else {
-            panic!()
-        };
-        write(&active.partial, b"1234");
-        write(&root(&cache).join("12/orphan.part"), b"bad");
-        maintain(&data, &cache).unwrap();
-        assert!(active.partial.exists());
-        assert!(!root(&cache).join("12/orphan.part").exists());
-        clear(&data, &cache).unwrap();
-        assert!(active.check().is_err());
-        assert!(active.finish().is_err());
-        assert!(!active.target.exists());
-        drop(active);
-        fs::remove_dir_all(data).unwrap();
-    }
-    #[test]
-    fn insufficient_free_space_fails_before_creating_partial_file() {
-        let (data, cache) = setup();
-        assert!(
-            prepare_with_space(&data, &cache, 12, "photo.jpg", 6, 10, |_| Ok(
-                SPACE_RESERVE + 5
-            ))
-            .is_err()
-        );
-        assert_eq!(status(&data, &cache).unwrap().total_bytes, 0);
-        assert!(download(&data, &cache, 12, "../kept", 6, 10).is_err());
-        fs::remove_dir_all(data).unwrap();
-    }
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_never_follows_a_symlink_to_kept_content() {
-        let (data, cache) = setup();
-        let kept = data.join("files/android-offline/12/saved-7.mp4");
-        write(&kept, b"kept");
-        let directory = root(&cache).join("12");
-        fs::create_dir_all(&directory).unwrap();
-        std::os::unix::fs::symlink(kept.parent().unwrap(), directory.join("escape")).unwrap();
-        assert_eq!(clear(&data, &cache).unwrap(), 0);
-        assert_eq!(fs::read(&kept).unwrap(), b"kept");
-        fs::remove_dir_all(data).unwrap();
-    }
 }

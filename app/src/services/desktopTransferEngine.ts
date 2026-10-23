@@ -38,7 +38,10 @@ export interface DesktopTransferJob {
     protectionMode?: string;
     protectMetadata?: boolean;
     videoUploadMode?: VideoUploadMode;
+    videoFilenameCaption?: boolean;
     tempZipPath?: string;
+    /** Set when another part of the app, such as Folder Sync, runs the transfer. */
+    origin?: string;
     progress: number;
     transferredBytes: number;
     totalBytes: number;
@@ -67,6 +70,7 @@ export interface DesktopTransferRequest {
     promptToken?: number;
     protectMetadata?: boolean;
     videoUploadMode?: VideoUploadMode;
+    videoFilenameCaption?: boolean;
     tempZipPath?: string;
     totalBytes?: number;
     initialStatus?: TransferStatus;
@@ -104,6 +108,7 @@ export const transferJobToUploadItem = (job: DesktopTransferJob): QueueItem => (
         protectMetadata: job.protectMetadata,
     } : undefined,
     videoUploadMode: job.videoUploadMode,
+    videoFilenameCaption: job.videoFilenameCaption,
 });
 
 export const transferJobToDownloadItem = (job: DesktopTransferJob): DownloadItem => ({
@@ -137,6 +142,7 @@ export const uploadItemToTransferRequest = (item: QueueItem): DesktopTransferReq
     promptToken: item.protection?.promptToken,
     protectMetadata: item.protection?.protectMetadata,
     videoUploadMode: item.videoUploadMode,
+    videoFilenameCaption: item.videoFilenameCaption,
     tempZipPath: item.tempZipPath,
     totalBytes: item.totalBytes,
     initialStatus: normalizeInitialStatus(item.status),
@@ -219,23 +225,17 @@ export async function listenToDesktopTransfers(
     const unlistenUpsert = await listen<DesktopTransferJob>('transfer-upserted', event => {
         onUpsert(event.payload);
     });
-    const unlistenRemove = await listen<string>('transfer-removed', event => {
-        onRemove(event.payload);
-    });
+    let unlistenRemove: UnlistenFn;
+    try {
+        unlistenRemove = await listen<string>('transfer-removed', event => {
+            onRemove(event.payload);
+        });
+    } catch (error) {
+        unlistenUpsert();
+        throw error;
+    }
     return () => {
         unlistenUpsert();
         unlistenRemove();
     };
-}
-
-export function mergeTransferJob(
-    jobs: DesktopTransferJob[],
-    incoming: DesktopTransferJob,
-): DesktopTransferJob[] {
-    const existing = jobs.find(job => job.id === incoming.id);
-    if (existing && existing.revision >= incoming.revision) return jobs;
-    const next = existing
-        ? jobs.map(job => job.id === incoming.id ? incoming : job)
-        : [...jobs, incoming];
-    return next.sort((left, right) => left.queuePosition - right.queuePosition);
 }

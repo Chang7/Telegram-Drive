@@ -16,7 +16,7 @@ Organize, transfer, preview, stream, sync, and share the files you keep in Saved
 [![oosmetrics](https://api.oosmetrics.com/api/v1/badge/achievement/029fb97b-a54a-4566-a1eb-aa1a5039065d.svg)](https://oosmetrics.com/repo/caamer20/Telegram-Drive)
 [![oosmetrics](https://api.oosmetrics.com/api/v1/badge/achievement/2aa6f3f9-fd8a-4523-bd73-6625ee6a948a.svg)](https://oosmetrics.com/repo/caamer20/Telegram-Drive)
 
-[Download for desktop](https://github.com/caamer20/Telegram-Drive/releases/latest) · [Find the latest Android preview](https://github.com/caamer20/Telegram-Drive/releases) · [Product website](https://caamer20.github.io/Telegram-Drive/) · [Changelog](CHANGELOG.md)
+[Download for desktop](https://github.com/caamer20/Telegram-Drive/releases/latest) · [Download Android 4.1.0](https://github.com/caamer20/Telegram-Drive/releases/tag/Androidv4.1.0) · [Product website](https://telegram-drive.com/) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -34,9 +34,9 @@ Telegram Drive turns Telegram's familiar file storage into a focused, desktop-st
 - [Features](#features)
 - [Screenshots](#screenshots)
 - [Folder Sync](#folder-sync-desktop)
-- [Encryption](#optional-client-side-encryption-alpha)
+- [Encryption](#optional-client-side-encryption-beta-format-frozen)
 - [Privacy and security](#privacy-and-security)
-- [Android and Google TV](#android-and-google-tv-signed-preview)
+- [Android and Google TV](#android-and-google-tv-signed-apk)
 - [Documentation](#documentation)
 - [Build from source](#build-from-source)
 
@@ -55,16 +55,16 @@ Telegram Drive turns Telegram's familiar file storage into a focused, desktop-st
 
 ## Download and install
 
-Desktop **3.9.0** and Android / Android TV **4.1.0 preview** are available below.
+Desktop **4.1.2** and Android / Google TV **4.1.0** use separate version lines. The desktop release does not update or include Android or Google TV. Downloads are listed below.
 
 | Platform | Download | Notes |
 | --- | --- | --- |
-| **Windows x64** | [Installer](https://github.com/caamer20/Telegram-Drive/releases/download/v3.9.0/Telegram.Drive_3.9.0_x64-setup.exe) | Includes the required Microsoft Visual C++ runtime setup |
-| **macOS — Apple Silicon** | [DMG](https://github.com/caamer20/Telegram-Drive/releases/download/v3.9.0/Telegram.Drive_3.9.0_aarch64.dmg) | For M-series Macs |
-| **macOS — Intel** | [DMG](https://github.com/caamer20/Telegram-Drive/releases/download/v3.9.0/Telegram.Drive_3.9.0_x64.dmg) | For Intel-based Macs |
-| **Linux x64** | [AppImage](https://github.com/caamer20/Telegram-Drive/releases/download/v3.9.0/Telegram.Drive_3.9.0_amd64.AppImage) · [Debian](https://github.com/caamer20/Telegram-Drive/releases/download/v3.9.0/Telegram.Drive_3.9.0_amd64.deb) · [RPM](https://github.com/caamer20/Telegram-Drive/releases/download/v3.9.0/Telegram.Drive-3.9.0-1.x86_64.rpm) · [Arch](https://github.com/caamer20/Telegram-Drive/releases/download/v3.9.0/telegram-drive-bin-3.9.0-1-x86_64.pkg.tar.zst) | Choose your distribution; Arch updates remain managed by pacman |
-| **Android phones and tablets** | [Signed universal APK](https://github.com/caamer20/Telegram-Drive/releases/download/Androidv4.1.0beta/Telegram-Drive-v4.1.0-android-universal.apk) | Android 7.0 or newer; supports ARM64, ARMv7, x86, and x86_64 |
-| **Android TV / Google TV** | [Signed TV-compatible APK](https://github.com/caamer20/Telegram-Drive/releases/download/Androidv4.1.0beta/Telegram-Drive-v4.1.0-android-universal.apk) | The same universal package includes the TV launcher and remote navigation |
+| **Windows x64** | [Installer](https://github.com/caamer20/Telegram-Drive/releases/download/v4.1.2/Telegram.Drive_4.1.2_x64-setup.exe) | Includes the required Microsoft Visual C++ runtime setup |
+| **macOS — Apple Silicon** | [DMG](https://github.com/caamer20/Telegram-Drive/releases/download/v4.1.2/Telegram.Drive_4.1.2_aarch64.dmg) | For M-series Macs |
+| **macOS — Intel** | [DMG](https://github.com/caamer20/Telegram-Drive/releases/download/v4.1.2/Telegram.Drive_4.1.2_x64.dmg) | For Intel-based Macs |
+| **Linux x64** | [AppImage](https://github.com/caamer20/Telegram-Drive/releases/download/v4.1.2/Telegram.Drive_4.1.2_amd64.AppImage) · [Debian](https://github.com/caamer20/Telegram-Drive/releases/download/v4.1.2/Telegram.Drive_4.1.2_amd64.deb) · [RPM](https://github.com/caamer20/Telegram-Drive/releases/download/v4.1.2/Telegram.Drive-4.1.2-1.x86_64.rpm) · [Arch](https://github.com/caamer20/Telegram-Drive/releases/download/v4.1.2/telegram-drive-bin-4.1.2-1-x86_64.pkg.tar.zst) | Choose your distribution; Arch updates remain managed by pacman |
+| **Android phones and tablets** | [Signed universal APK](https://github.com/caamer20/Telegram-Drive/releases/download/Androidv4.1.0/Telegram-Drive-v4.1.0-android-universal.apk) | Android 7.0 or newer; supports ARM64, ARMv7, x86, and x86_64 |
+| **Android TV / Google TV** | [Signed TV-compatible APK](https://github.com/caamer20/Telegram-Drive/releases/download/Androidv4.1.0/Telegram-Drive-v4.1.0-android-universal.apk) | The same universal package includes the TV launcher and remote navigation |
 
 The new desktop workspace adds collections, saved searches, a media timeline, Continue Watching, offline trip packs, transfer activity, storage controls, cleanup, and sync previews. Android 4.1.0 includes the latest native media and offline improvements and fixes the folder sidebar reported in [issue #212](https://github.com/caamer20/Telegram-Drive/issues/212). Install the signed APK over your existing app to preserve its data and activation.
 
@@ -122,12 +122,15 @@ The application caps a Telegram object at exactly **2,000,000,000 bytes**. Encry
 ### Viewing, playback, and archives
 
 - Lazy-loaded thumbnails and bounded memory/disk preview caches.
+- Desktop HEIC/HEIF still images use bounded JPEG display renditions in previews, gallery/slideshow and offline viewing. macOS tries `/usr/bin/sips` first; other desktops need user-installed FFmpeg 8.1 or newer. External opening and downloads keep the original. See [HEIC preview limits](Docs/HEIC_PREVIEW.md).
 - A desktop image viewer with zoom, pan, fit-to-window, actual-size, wheel, double-click, and keyboard navigation controls.
 - Built-in PDF viewer and audio player.
 - Video playback with seeking, HLS/fMP4 streaming, remuxing/transcoding fallbacks, and cache recovery for supported plaintext media.
+- Desktop MP4/M4V/MOV uploads in Media mode attach a locally generated JPEG preview and video dimensions/duration. Windows uses its native media decoder first; macOS/Linux need FFmpeg. If decoding is unavailable, choose File mode. Original video bytes are preserved; immediate streaming requires early MP4 metadata.
 - Native Android playback with system media controls, resume, subtitle/audio-track selection, playback speed, and Picture-in-Picture where supported.
 - ZIP, RAR, and 7z archive browsing and extraction, including extraction back into Telegram Drive where the platform supports it.
 - Offline preview-cache controls for recently viewed standard files.
+- Recorded plain previews, thumbnails and ready offline copies from 3.9.x retain external opening after an update. The first open verifies and registers each private cache file; arbitrary files and edited copies remain refused.
 
 Some media depends on operating-system codec support or FFmpeg. Supported protected audio, video, and PDF content can use authenticated local byte-range streaming while the vault is unlocked, without publishing a persistent plaintext copy. See [encrypted-file limitations](#current-encrypted-file-limitations).
 
@@ -188,7 +191,9 @@ Safety behavior includes:
 
 Folder Sync is disabled until enabled in **Settings → Folder Sync**. Read the [Folder Sync guide](SYNC_GUIDE.md) before mapping an important directory, and keep a separate tested backup.
 
-## Optional client-side encryption (alpha)
+## Optional client-side encryption (beta, format frozen)
+
+See the [frozen format specification](Docs/TDENC2_FORMAT.md) and [recovery drill](Docs/ENCRYPTION_RECOVERY_DRILL.md).
 
 Telegram Drive includes opt-in encrypted transfers using the versioned **TDENC2** envelope. Standard uploads remain the default. Encryption can be selected as a default for future uploads or chosen for an individual upload.
 
@@ -204,7 +209,7 @@ The implementation provides streaming XChaCha20-Poly1305 encryption before uploa
 > [!CAUTION]
 > **Telegram Drive cannot recover, reset, or reconstruct a lost vault passphrase, file passphrase, encryption key, or unusable recovery bundle.** Protect and test your recovery material and keep an independent backup of important files. Lost credentials or damaged recovery material can make encrypted data permanently unrecoverable.
 
-The encryption design and implementation have **not received an independent security audit**. Use isolated test data first. This alpha feature is not a substitute for a tested backup strategy.
+The encryption design and implementation have **not received an independent security audit**. Use isolated test data first. This frozen-format beta is not a substitute for a tested backup strategy.
 
 ### Current encrypted-file limitations
 
@@ -247,7 +252,7 @@ Telegram Drive supports a **System** language preference and these 24 selectable
 | Bengali (Bangladesh) | Indonesian | Filipino (Philippines) | Turkish |
 | Thai (Thailand) | Japanese | Korean | Vietnamese |
 
-Locale selection and formatting are production-supported. Some translated entries may still fall back to English, and full native-language, legal-copy, RTL, long-string, CJK, and accessibility review remains ongoing.
+Locale selection and formatting are production-supported. Authentication, encryption, desktop supporter copy and visible data arrays use canonical translations, and the eleven large locales have zero copied-English findings. Mobile follow-up changes remain local under the owner’s pre-commit hook. Noncritical English copy and full native-language, legal-copy, RTL, long-string, CJK and device review remain outstanding; see [the measured locale review](Docs/LOCALIZATION_BUDGET_REVIEW.md).
 
 ## Optional $5 lifetime ad-free supporter license
 
@@ -263,11 +268,11 @@ Every Telegram Drive feature is available to non-paying users. Supported desktop
 > [!WARNING]
 > Save the recovery code shown after activation. Payment alone does not bypass verification. Refunds are not automatic or guaranteed except where required by law. A refund, payment reversal, chargeback, or upheld dispute revokes the associated ad-free entitlement. Read the [Supporter Terms](SUPPORTER_TERMS.md) before paying.
 
-## Android and Google TV (signed preview)
+## Android and Google TV (signed APK)
 
-The Android build is currently distributed separately from the desktop release as a signed sideload preview. It is not available through Google Play.
+The Android build is currently distributed separately from the desktop release as a signed sideload release. It is not available through Google Play.
 
-1. Open the [Android / Android TV 4.1.0 release](https://github.com/caamer20/Telegram-Drive/releases/tag/Androidv4.1.0beta).
+1. Open the [Android / Android TV 4.1.0 release](https://github.com/caamer20/Telegram-Drive/releases/tag/Androidv4.1.0).
 2. Download the signed universal Android APK listed in that release.
 3. On Android, allow **Install unknown apps** for the browser or file manager you used.
 4. Open the APK and choose **Install**.
@@ -321,6 +326,7 @@ Do not expose these ports to a LAN or the internet. See the [REST API endpoint r
 | [Supporter service operations](SUPPORTER_SERVICE.md) | Worker, PayPal, D1, secure configuration, and release checks |
 | [Supporter backup and recovery](SUPPORTER_BACKUP_RECOVERY.md) | D1 backup provisioning, restore drills, and production recovery |
 | [Android and Google TV release runbook](Docs/ANDROID_SIDELOAD_RELEASE.md) | Signing, packaging, acceptance, and sideload-release checks |
+| [Desktop code signing](Docs/CODE_SIGNING.md) | macOS notarization and Windows Authenticode settings, and first-signed-release acceptance |
 
 ## Build from source
 
@@ -366,17 +372,19 @@ On Windows, the build scripts download and validate Microsoft's signed Visual C+
 
 ### Validation
 
-Run the relevant checks from `app/` before submitting changes:
+Behavioral tests are end-to-end journeys; there are no unit suites. Run the relevant checks from `app/` before submitting changes:
 
 ```bash
-npm run build
+npm run build:verify
 npm test
 npm run i18n:check
 cd src-tauri
 cargo fmt --all -- --check
-cargo clippy --lib --all-targets -- -D warnings
-cargo test --lib
+cargo clippy --locked --features native-e2e --lib --all-targets -- -D warnings
+cargo test --locked --features native-e2e --test native_e2e
 ```
+
+`node scripts/run-e2e.cjs` from the repository root runs every host suite. See [TESTING.md](TESTING.md) for what each suite covers and what still needs installed-app or device acceptance.
 
 The application is built with Tauri 2, Rust, React 19, TypeScript, Tailwind CSS 4, TanStack Query/Virtual, SQLite, Tokio, Actix Web, Grammers, PDF.js, HLS.js, and MP4Box.
 
@@ -412,3 +420,7 @@ Direct cryptocurrency tips help support development but **do not** activate the 
 Telegram Drive is not affiliated with Telegram FZ-LLC. Use the application responsibly and in accordance with Telegram's terms and applicable law.
 
 </div>
+
+### TV field navigation
+
+With TV directional navigation, arrows edit a focused native field. After finishing an edit (or closing a native select picker), press Escape to return that field to directional navigation; the next arrow moves focus to another control. Enter resumes editing. A second Escape while already in navigation mode keeps the normal dialog-close behavior. Browser Escape is verified; physical Google TV Back event delivery and remote acceptance remain unrun.

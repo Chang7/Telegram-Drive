@@ -1,3 +1,4 @@
+import i18n from '../i18n';
 import { useState, useEffect, useCallback, createContext, useContext, ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { type as osType } from '@tauri-apps/plugin-os';
@@ -10,8 +11,9 @@ import type {
     EncryptionSettings,
     VaultStatus,
     FileEncryptionInfo,
-    EncryptionState,
     CryptoInventory,
+    RecoveryImportOptions,
+    RecoveryVerification,
 } from '../types';
 
 interface EncryptionContextType {
@@ -28,11 +30,13 @@ interface EncryptionContextType {
     unlockVault: (passphrase: string) => Promise<number>;
     lockVault: () => Promise<void>;
     createVault: (passphrase: string) => Promise<void>;
-    changeVaultPassphrase: (newPassphrase: string) => Promise<void>;
+    changeVaultPassphrase: (currentPassphrase: string, newPassphrase: string) => Promise<void>;
     getFileEncryptionInfo: (messageId: number, folderId: number | null) => Promise<FileEncryptionInfo>;
     generateRecoveryKey: () => Promise<string>;
     exportRecovery: (recoveryPassphrase: string) => Promise<string>;
-    importRecovery: (bundle: string, recoveryPassphrase: string) => Promise<void>;
+    /** Proves a bundle can restore the unlocked vault. Changes nothing. */
+    verifyRecovery: (bundle: string, recoveryPassphrase: string) => Promise<RecoveryVerification>;
+    importRecovery: (bundle: string, recoveryPassphrase: string, options?: RecoveryImportOptions) => Promise<void>;
 }
 
 const EncryptionContext = createContext<EncryptionContextType | undefined>(undefined);
@@ -54,7 +58,7 @@ export function EncryptionProvider({ children }: { children: ReactNode }) {
         try {
             const caps = await invoke<EncryptionCapabilities>('cmd_get_encryption_capabilities');
             if (caps.contract_version !== 2) {
-                throw new Error(`Unsupported encryption command contract ${String(caps.contract_version)}`);
+                throw new Error(i18n.t('protection_labels.contract_error', { version: String(caps.contract_version) }));
             }
             setCapabilities(caps);
             setCapabilityState(
@@ -116,7 +120,7 @@ export function EncryptionProvider({ children }: { children: ReactNode }) {
         invoke<EncryptionSettings>('cmd_update_encryption_settings', { settings: effectiveSettings })
             .then(setSettings)
             .catch(error => {
-                setCapabilityError(previous => previous ?? `Encryption settings were rejected: ${String(error)}`);
+                setCapabilityError(previous => previous ?? i18n.t('protection_labels.settings_rejected', { error: String(error) }));
             });
     }, [
         appSettings.encryptionAutoLockMinutes,
@@ -186,8 +190,8 @@ export function EncryptionProvider({ children }: { children: ReactNode }) {
         await refreshVaultStatus();
     }, [refreshVaultStatus]);
 
-    const changeVaultPassphrase = useCallback(async (newPassphrase: string) => {
-        await invoke('cmd_change_vault_passphrase', { newPassphrase });
+    const changeVaultPassphrase = useCallback(async (currentPassphrase: string, newPassphrase: string) => {
+        await invoke('cmd_change_vault_passphrase', { currentPassphrase, newPassphrase });
         await refreshVaultStatus();
     }, [refreshVaultStatus]);
 
@@ -211,14 +215,27 @@ export function EncryptionProvider({ children }: { children: ReactNode }) {
         });
     }, []);
 
+    const verifyRecovery = useCallback(async (
+        bundle: string,
+        recoveryPassphrase: string,
+    ): Promise<RecoveryVerification> => {
+        return await invoke<RecoveryVerification>('cmd_verify_vault_recovery', {
+            bundleBase64: bundle,
+            recoveryPassphrase,
+        });
+    }, []);
+
     const importRecovery = useCallback(async (
         bundle: string,
         recoveryPassphrase: string,
+        options: RecoveryImportOptions = {},
     ): Promise<void> => {
         await invoke('cmd_import_vault_recovery', {
             bundleBase64: bundle,
             recoveryPassphrase,
+            vaultPassphrase: options.vaultPassphrase || null,
             replaceExisting: true,
+            allowKeyReplacement: options.allowKeyReplacement === true,
         });
         await refreshVaultStatus();
     }, [refreshVaultStatus]);
@@ -241,6 +258,7 @@ export function EncryptionProvider({ children }: { children: ReactNode }) {
         getFileEncryptionInfo,
         generateRecoveryKey,
         exportRecovery,
+        verifyRecovery,
         importRecovery,
     };
 
@@ -257,18 +275,4 @@ export function useEncryption() {
         throw new Error('useEncryption must be used within an EncryptionProvider');
     }
     return ctx;
-}
-
-export function resolveEncryptionState(
-    info: FileEncryptionInfo | undefined,
-    vaultUnlocked: boolean,
-): EncryptionState {
-    if (!info || info.state === 'plain') return 'plain';
-    if (info.state === 'encrypted_verifying') return 'encrypted_verifying';
-    if (info.state === 'encrypted_corrupt') return 'encrypted_corrupt';
-    if (info.state === 'encrypted_unsupported_version') return 'encrypted_unsupported_version';
-    if (info.state === 'encrypted_key_missing') return 'encrypted_key_missing';
-
-    if (vaultUnlocked) return 'encrypted_unlocked';
-    return 'encrypted_locked';
 }

@@ -1,3 +1,134 @@
+## [4.1.2] - 2026-10-14
+
+### Desktop video streaming metadata
+
+- Correct the overly restrictive MP4 streaming-eligibility check introduced in 4.1.1. Valid trailing-metadata layouts accepted by Telegram Desktop now receive the matching streaming flag for local and URL Media uploads.
+- Preserve the original video bytes, JPEG previews, dimensions, duration and filename captions. File mode, protected uploads, resumable transfers, cancellation, account isolation and quota checks retain their existing paths.
+- Existing sessions, vaults, settings and lifetime supporter activations remain compatible. The optional $5.00 USD one-time lifetime ad-free license and recovery rights are unchanged.
+
+### Desktop media controls and dropdowns
+
+- Give labeled playback actions room to fit and group skip, speed, volume and library actions with consistent spacing. Controls and keyboard hints wrap cleanly in smaller windows.
+- Keep video and audio viewers inside the available viewport, with scrollable bookmarks/queue details and accessible Close/Fullscreen controls. Quality badges remain anchored to the video.
+- Match speed, sleep timer, slideshow interval, settings, sync and workspace dropdown styling while preserving native selection, keyboard behavior and touch targets.
+
+### Dependency security
+
+- Update Rustls to [0.23.46](https://github.com/rustls/rustls/releases/tag/v/0.23.46), addressing the upstream TLS advisories detected by the release dependency gate.
+
+### Verification
+
+- The existing large-container upload journey failed at the streaming-flag assertion before the correction. All 215 native journeys and all 133 browser journeys passed locally, including captions, sync settings, slideshow, visual, accessibility and TV keyboard navigation checks; full release suites and platform package checks remain publication gates.
+- Automated Telegram boundaries use controlled fixtures. Streaming and seeking with the reporter's actual video over 200 MB on a clean Windows Telegram Desktop receiver remain pending owner acceptance after this release.
+
+## [4.1.1] - 2026-10-13
+
+### Desktop video media uploads
+
+- Attach a locally generated JPEG preview and explicit dimensions/duration to unencrypted MP4 Media uploads, including large files and uploads from a URL. This supplies the thumbnail and video attributes Telegram Desktop needs to display its player.
+- Set streaming metadata from the MP4 container layout while preserving the original video bytes. Videos with metadata at the end of the file may still need downloading before playback.
+- Use the native Windows video decoder first, with FFmpeg as a fallback. macOS and Linux require FFmpeg for video thumbnails; an unavailable decoder offers File mode instead of silently uploading incomplete Media metadata.
+- Preserve filename captions, account isolation, cancellation, retries and transfer quotas. Protected videos retain their existing private upload path.
+
+### Compatibility and verification
+
+- Existing vaults, sessions, queues, settings and lifetime supporter activations remain compatible. Every feature remains available without payment; the optional $5.00 USD one-time lifetime ad-free license, recovery codes and three-device allowance are unchanged.
+- Desktop native and browser regressions passed, including synthetic H.264 MP4 containers over 200 MiB and Windows native decoding. Automated Telegram boundaries use controlled fixtures; the reporter's exact file/codec, live Telegram Desktop playback and rotated-video acceptance remain unrun.
+- Android 4.1.0 remains a separate APK release. The product page deploys from the protected main branch after stable Desktop publication.
+
+## [4.1.0] - 2026-10-13
+
+### Video uploads and settings
+
+- Add original filenames as captions for unencrypted video media uploads by default, with a saved setting to disable them. Queued uploads retain their caption choice across interruption and restart. Protected uploads keep filenames private.
+- Align desktop transfer preferences and vault settings with consistent grouped controls, readable labels, larger targets, and verified light/dark contrast.
+- Improve protected-upload setup, cancellation, loading failures and retry. Passphrase-only protection remains available without creating or unlocking a vault.
+
+### Compatibility and verification
+
+- Preserve the account isolation, transfer recovery, vault recovery drills, protected media handling, search, HEIC previews and release protections shipped in 4.0.0.
+- TDENC2 remains a frozen-format beta with independent cryptographic review pending. Existing vaults, settings, queues, sessions and lifetime supporter activations remain compatible.
+- Every feature remains available without payment. The optional $5.00 USD one-time lifetime ad-free license, recovery codes and three-device allowance are unchanged.
+- Android is compiled locally and published independently as a separate binary release. Android project and source changes are excluded from this desktop release.
+- Automated browser, native, Worker, localization, security, dependency, packaging and provenance checks remain release gates. Live Telegram, physical-device and manual installed-platform acceptance remain separate from controlled-fixture results.
+
+## [4.0.0] - 2026-10-05
+
+### Highlights
+
+- Search your Telegram library with account-scoped full-text filters, collections, saved searches and a media timeline.
+- Browse HEIC/HEIF photos and offline copies while preserving the original files. macOS previews are built in; Windows and Linux require FFmpeg 8.1 or newer.
+- Reopen unchanged app-produced files instantly on eligible filesystems, including after a restart. Files with changed or unsupported identities are verified in full.
+- Keep transfers, folder listings, local services and sign-in responsive, with clearer recovery and localized navigation across 24 languages.
+
+### Compatibility and visible changes
+
+- **REST API changes for scripts:** timestamps use RFC 3339, identifiers support 64-bit values, listings include complete results and explicit partial coverage, and the API publishes an OpenAPI document. Update clients that depend on the older shapes.
+- **Open externally** permits only files the app produced or recorded plain caches from earlier releases. Account and protection checks remain active. Arbitrary paths, symlinks and modified contents are refused; recorded 3.9.x previews, thumbnails and ready offline copies remain available after upgrade.
+- **Sponsor placements return every 15 minutes.** Active and offline-grace supporter entitlements continue to suppress every sponsor advertisement.
+- **TDENC2 encryption is a frozen-format beta.** Passphrases use masked dialogs, and recovery drills verify bundles without replacing the active vault. Independent cryptographic review remains pending.
+- Every Telegram Drive feature is available to non-paying users. Supported desktop and Android builds offer an optional **$5.00 USD Lifetime Ad-Free Supporter License** that removes sponsor placements on up to three supported Windows, macOS, Linux, or Android devices in total after one verified PayPal payment. It is a one-time purchase, **not a subscription**. Normal app updates preserve activation; existing purchasers do not need to buy again, and recovery codes remain supported.
+- **Android and Google TV are not part of this release.** Desktop 4.0.0 and the Android/Google TV 4.1.0 preview use independent version lines.
+
+### Workspace, reliability and localization
+
+- Folder, REST and WebDAV views share account-scoped inventory, retain older cached entries in partial listings and refresh after local changes. Search applies type, size, date, folder, tag, collection, favorite and protection filters before paging.
+- Offline packs, gallery/slideshow navigation, archive previews, preview-cache controls and transfer activity preserve source identity and account isolation. Protected files do not produce plaintext HEIC renditions.
+- Sign-out revokes the Telegram session before removing it locally and explains remote revocation failures. Wrong two-step verification passwords can be corrected without restarting sign-in.
+- Local servers recover from occupied ports. Redacted diagnostics identify startup failures, and staged files use private directories with cleanup at startup.
+- Storage checks correctly detect available space on Windows.
+- **Clear finished** removes completed, failed and cancelled uploads and downloads from the transfer queue while preserving ongoing work.
+- Tray menus, transfer notifications, share-password pages, settings, authentication, encryption, Help and viewer controls use localized copy. Language changes preserve dialog and application state; accessibility improvements cover focus, labels and contrast.
+
+### Verify downloads
+
+Download the installer and `SHA256SUMS.txt` from this release. On Linux use `sha256sum -c SHA256SUMS.txt`; on macOS use `shasum -a 256` for the selected file; on Windows use `Get-FileHash -Algorithm SHA256` and compare the matching manifest entry.
+
+Verify provenance with the expected repository and inspect the reported workflow and tag:
+
+```sh
+gh attestation verify ./DOWNLOADED_ARTIFACT --repo caamer20/Telegram-Drive
+```
+
+Do not install if verification fails or identifies an unexpected producer. Source and Arch runtime SBOMs and Sigstore bundles accompany the release. See [download verification](Docs/RELEASE_NOTES_TEMPLATE.md).
+
+## [3.9.8] - 2026-09-29
+
+### Desktop reliability
+
+- Share update checks and installation progress between Settings and the update banner, with recovery from unavailable local release-note storage.
+- Correct proxy/VPN settings requests and preserve saved settings when startup reads fail.
+- Improve search-filter presentation, supporter license explanations, and translated desktop messaging.
+- Correct local streaming/share route coexistence and remove unused internal code while preserving account, encryption, transfer, and lifetime supporter compatibility.
+
+### Release verification
+
+- Replace retired unit runners with browser, native process/HTTP/storage, Worker HTTP/local-D1, and release-tool E2E journeys.
+- Retain dependency assurance, security/configuration checks, formatting, localization, bundle budgets, and platform build gates.
+- External Telegram/PayPal boundaries use controlled fixtures in automated suites; these do not replace live-service or installed-device acceptance.
+
+## [3.9.5] - 2026-09-22
+
+### Desktop reliability
+
+- Fixed session database contention that could interrupt streaming or leave file loading unavailable after upgrading.
+- Restored workspace access after signing out and signing back in without restarting, including QR, phone-code, and two-step authentication.
+- Added bounded retries for temporary account lookup failures and made manual sync retry account verification.
+- Prevented stalled encrypted metadata requests from blocking an entire folder. Deferred files remain protected until their metadata can be retrieved.
+- Allowed folder refresh to recover from malformed optional cached metadata while preserving account isolation and stored records.
+- Kept the loading indicator visible while an uncached folder is being scanned instead of prematurely displaying an empty folder.
+- Improved sign-out progress, failure reporting, duplicate-attempt handling, and legacy local credential cleanup. Optional haptic feedback can no longer block confirmation.
+
+### Themes
+
+- Added AMOLED, Ocean, Forest, Plum, Paper, Rose, Mint, and Sky presets while preserving existing themes.
+
+### Compatibility
+
+- Preserved Telegram sessions, existing data, account isolation, and the $5.00 USD one-time lifetime ad-free license, recovery codes, and three-device allowance.
+- This desktop release remains compatible with the database format introduced in 3.9.0. Older 3.8.x applications cannot open that newer format; downgrading the executable does not downgrade saved data.
+- Added regression coverage for concurrent session activity, fresh sign-in, stale authentication replies, folder recovery, sign-out confirmation, and theme contrast.
+
 ## [3.9.0] - 2026-09-12
 
 ### Workspace and media

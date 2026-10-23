@@ -187,7 +187,7 @@ export function FileExplorer({
             : <ArrowDown className="h-3 w-3 text-app-accent" />;
     };
 
-    if (loading) {
+    if (loading || (!error && syncProgress?.active && files.length === 0)) {
         return (
             <div className="custom-scrollbar flex-1 overflow-hidden p-3" aria-label={t('common.loading')}>
                 {viewMode === 'grid' ? (
@@ -297,7 +297,7 @@ export function FileExplorer({
                                                 onPreview={() => handlePreviewRequest(file)}
                                                 activeFolderId={sourceFolder(file, activeFolderId)}
                                                 height={cardHeight}
-                                                onToggleSelection={() => onToggleSelection(file.id)}
+                                                onToggleSelection={selectionDisabled ? undefined : () => onToggleSelection(file.id)}
                                                 onShare={onShare ? () => onShare(file) : undefined}
                                                 selectedIds={selectedIds}
                                                 disableDrag={selectionDisabled}

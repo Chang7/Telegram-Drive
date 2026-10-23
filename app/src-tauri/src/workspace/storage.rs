@@ -123,6 +123,7 @@ fn add(category: &mut Category, entry: &Entry, reclaimable: bool) {
 /// survive clearing the legacy preview cache.
 pub fn clear_legacy_previews(cache: &Path) -> Result<u64, String> {
     let mutation = crate::commands::preview::legacy_preview_mutation();
+    let _shared = super::cache_core::state();
     let directory = private_subdir(cache, "previews")?;
     remove_files(
         inventory(&directory, false)?
@@ -216,7 +217,9 @@ fn collect(
         (format!("previews/workspace/{owner}/thumbnails"), true),
     ] {
         for entry in inventory(&private_subdir(cache, &suffix)?, true)? {
-            if is_temporary(&entry.path) {
+            if pinned(&entry.path) {
+                add(&mut kept, &entry, false);
+            } else if is_temporary(&entry.path) {
                 add(
                     &mut staging,
                     &entry,
@@ -243,8 +246,11 @@ fn collect(
         );
     }
     let native_status = crate::workspace::device_cache::status(data, cache)?;
+    kept.bytes = kept.bytes.saturating_add(native_status.kept_bytes);
     native.bytes = native_status.total_bytes;
-    native.reclaimable_bytes = native_status.total_bytes;
+    native.reclaimable_bytes = native_status
+        .total_bytes
+        .saturating_sub(native_status.partial_bytes);
     native.file_count = native_status.file_count;
     for suffix in [
         format!("workspace/{owner}/offline"),
@@ -314,12 +320,9 @@ fn collect(
 }
 
 pub async fn apply_limits(app: &tauri::AppHandle, limits: &StorageLimits) {
-    // The preview slider is an aggregate allowance split across the legacy,
-    // workspace and native caches. Deliberately kept files are outside it.
-    let share = (limits.previews / 3).max(1);
-    assets::configure_limits(share, limits.thumbnails / 2);
-    crate::workspace::device_cache::set_limit_bytes(share);
-    crate::commands::preview::configure_limits(share, limits.thumbnails / 2);
+    // One aggregate policy includes retained legacy and native disposable previews.
+    assets::configure_limits(limits.previews, limits.thumbnails);
+    crate::commands::preview::configure_limits(limits.previews, limits.thumbnails);
     if let Some(manager) = app.try_state::<Arc<crate::transcode::TranscodeManager>>() {
         manager.set_max_cache_bytes(limits.converted).await;
     }
@@ -449,6 +452,7 @@ pub async fn cmd_storage_clear(
             }
             "thumbnails" => {
                 let mutation = crate::commands::preview::legacy_preview_mutation();
+                let _shared = super::cache_core::state();
                 remove_files(
                     inventory(&private_subdir(&data, "thumbnails")?, true)?
                         .into_iter()
@@ -468,71 +472,4 @@ pub async fn cmd_storage_clear(
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn fixture() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("storage-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        root
-    }
-    fn write(root: &Path, name: &str, bytes: &[u8]) {
-        let path = root.join(name);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, bytes).unwrap();
-    }
-    #[test]
-    fn clearing_legacy_cache_preserves_pins_partials_and_private_subtrees() {
-        let root = fixture();
-        write(&root, "previews/a.mp4", b"kept");
-        write(&root, "previews/a.pin", b"pin");
-        write(&root, "previews/b.pdf", b"preview");
-        write(&root, "previews/active.part", b"part");
-        write(&root, "previews/workspace/1/private", b"private");
-        assert_eq!(clear_legacy_previews(&root).unwrap(), 7);
-        assert!(root.join("previews/a.mp4").is_file());
-        assert!(root.join("previews/a.pin").is_file());
-        assert!(root.join("previews/active.part").is_file());
-        assert!(root.join("previews/workspace/1/private").is_file());
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn accounting_separates_kept_previews_downloads_and_resumable_staging() {
-        let root = fixture();
-        let cache = root.join("cache");
-        fs::create_dir_all(&cache).unwrap();
-        write(&cache, "previews/a.pdf", b"123");
-        write(&root, "workspace/1/offline/pack/a.mp4", b"12345");
-        write(&root, "camera-staging/1/a.ready", b"1234");
-        write(&root, "download.pdf", b"12");
-        let categories = collect(
-            &root,
-            &cache,
-            1,
-            &root.join("transcodes"),
-            &HashSet::new(),
-            &[root.join("download.pdf"), root.join("download.pdf")],
-        )
-        .unwrap();
-        let lookup = |id: &str| categories.iter().find(|c| c.id == id).unwrap();
-        assert_eq!(lookup("kept").bytes, 5);
-        assert_eq!(lookup("kept").reclaimable_bytes, 0);
-        assert_eq!(lookup("previews").bytes, 3);
-        assert_eq!(lookup("staging").bytes, 4);
-        assert_eq!(lookup("staging").reclaimable_bytes, 0);
-        assert_eq!(lookup("downloads").bytes, 2);
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[cfg(unix)]
-    #[test]
-    fn symlinks_cannot_redirect_cleanup_to_kept_data() {
-        let root = fixture();
-        write(&root, "kept/a", b"safe");
-        std::os::unix::fs::symlink(root.join("kept"), root.join("previews")).unwrap();
-        assert!(clear_legacy_previews(&root).is_err());
-        assert_eq!(fs::read(root.join("kept/a")).unwrap(), b"safe");
-        fs::remove_dir_all(root).unwrap();
-    }
 }

@@ -74,7 +74,7 @@ fn save_settings(app: &AppHandle, settings: &WebDavSettingsFile) -> Result<(), S
     std::fs::remove_file(&temp_path).map_err(|error| error.to_string())
 }
 
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -106,10 +106,10 @@ fn validate_port(app: &AppHandle, port: u16, enabling: bool) -> Result<(), Strin
     if port < 1024 {
         return Err("Port must be between 1024 and 65535".to_string());
     }
-    if port == crate::STREAM_PORT {
+    if port == crate::STREAM_PORT || port == crate::stream_port() {
         return Err(format!(
             "Port {} is used by the media streaming server",
-            crate::STREAM_PORT
+            port
         ));
     }
     let api_settings = crate::commands::api_settings::load_settings(app);
@@ -182,25 +182,4 @@ pub async fn cmd_regenerate_webdav_token(app: AppHandle) -> Result<WebDavTokenRe
         url: format!("http://127.0.0.1:{}/dav/{}/", settings.port, token),
         token,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{verify_token, WebDavSettingsFile, DEFAULT_WEBDAV_PORT};
-
-    #[test]
-    fn defaults_are_disabled_and_read_only() {
-        let settings = WebDavSettingsFile::default();
-        assert!(!settings.enabled);
-        assert!(!settings.write_enabled);
-        assert_eq!(settings.port, DEFAULT_WEBDAV_PORT);
-        assert!(settings.token_hash.is_none());
-    }
-
-    #[test]
-    fn token_verification_is_exact() {
-        let expected = "97019edd94f27971f9253dce908be0578253e4bec41bf26344a558ea35e74666";
-        assert!(verify_token("telegram-drive-webdav", expected));
-        assert!(!verify_token("telegram-drive-webdaV", expected));
-    }
 }

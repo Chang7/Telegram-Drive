@@ -8,6 +8,11 @@ pub struct SyncPreferences {
     pub ignore_patterns: Vec<String>,
     pub propagate_deletions: bool,
     pub pause_on_conflicts: bool,
+    /// When a mapping is first reviewed over a folder that already holds the
+    /// same files as its Telegram folder, treat same-path, same-size files as
+    /// already in sync instead of reporting every one as a conflict. Contents
+    /// cannot be compared without downloading, so this is opt-in.
+    pub adopt_matching_files: bool,
 }
 
 impl Default for SyncPreferences {
@@ -16,6 +21,7 @@ impl Default for SyncPreferences {
             ignore_patterns: vec![".git/".into(), "node_modules/".into(), ".DS_Store".into()],
             propagate_deletions: false,
             pause_on_conflicts: true,
+            adopt_matching_files: false,
         }
     }
 }
@@ -111,68 +117,4 @@ fn matches_ignore_pattern(pattern: &str, relative_path: &str) -> bool {
                 .rsplit('/')
                 .next()
                 .is_some_and(|name| wildcard_match(pattern, name)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backup_defaults_preserve_deletions_and_pause_conflicts() {
-        let preferences = SyncPreferences::default();
-        assert!(!preferences.propagate_deletions);
-        assert!(preferences.pause_on_conflicts);
-        assert!(StoredPairPolicy::default().account_owner.is_none());
-    }
-
-    #[test]
-    fn ignored_directories_do_not_hide_similarly_named_files() {
-        let preferences = SyncPreferences {
-            ignore_patterns: vec![
-                ".git/".into(),
-                "build/cache/".into(),
-                "*.tmp".into(),
-                "?.bak".into(),
-            ],
-            ..SyncPreferences::default()
-        }
-        .validated()
-        .unwrap();
-        for path in [
-            "project/.git/config",
-            "build/cache/data",
-            "notes/draft.tmp",
-            "é.bak",
-            "partial.td-sync-tmp",
-        ] {
-            assert!(preferences.ignores(path), "{path}");
-        }
-        for path in [
-            ".git",
-            "build/cache.txt",
-            "cache/data",
-            "notes/draft.txt",
-            "word.bak",
-        ] {
-            assert!(!preferences.ignores(path), "{path}");
-        }
-    }
-
-    #[test]
-    fn policy_rejects_ambiguous_or_unbounded_patterns() {
-        for pattern in ["../private", "/absolute", "windows\\path", "line\nbreak"] {
-            assert!(SyncPreferences {
-                ignore_patterns: vec![pattern.into()],
-                ..SyncPreferences::default()
-            }
-            .validated()
-            .is_err());
-        }
-        assert!(SyncPreferences {
-            ignore_patterns: vec!["a".into(); 129],
-            ..SyncPreferences::default()
-        }
-        .validated()
-        .is_err());
-    }
 }

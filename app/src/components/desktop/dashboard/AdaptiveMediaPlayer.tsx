@@ -1,10 +1,11 @@
+import {useTranslation} from 'react-i18next';
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { X, ChevronLeft, ChevronRight, AlertTriangle, Loader2, RefreshCw, StopCircle, Maximize2, Minimize2, Volume2, VolumeX, Volume1, Play, Activity, Trash2, Zap } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { toast } from 'sonner';
 import type Hls from 'hls.js';
-import { TelegramFile, StreamingQuality, TranscodePrepareResult, TranscodeJobPhase, TranscodeCapabilities, MasterPlaylistInfo, QUALITY_LABELS, HLS_QUALITIES } from '../../../types';
+import { TelegramFile, StreamingQuality, TranscodePrepareResult, TranscodeJobPhase, TranscodeCapabilities, MasterPlaylistInfo, qualityLabel, HLS_QUALITIES } from '../../../types';
 import { useAdaptiveStreaming } from '../../../hooks/useAdaptiveStreaming';
 import { QualitySelector } from '../../shared/QualitySelector';
 import { FfmpegInstallNotice } from '../../shared/FfmpegInstallNotice';
@@ -39,6 +40,7 @@ export function AdaptiveMediaPlayer({
     streamUrl,
     playback,
 }: AdaptiveMediaPlayerProps) {
+    useTranslation();
     // ── Restart counter for MSE pipeline reinit ──────────────────────
     // Must be declared BEFORE restartStreamUrl useMemo
     const [restartNonce, setRestartNonce] = useState(0);
@@ -258,7 +260,7 @@ export function AdaptiveMediaPlayer({
     const handleOriginalPlaybackError = useCallback((event: React.SyntheticEvent<HTMLVideoElement>) => {
         playbackConfirmedRef.current = false;
         setPlaybackConfirmed(false);
-        setOriginalPlaybackError(event.currentTarget.error?.message || 'Unknown error');
+        setOriginalPlaybackError(event.currentTarget.error?.message || i18n.t('transfer_copy.unknown_error'));
     }, []);
 
     // ── Volume state ─────────────────────────────────────────────────
@@ -952,35 +954,35 @@ export function AdaptiveMediaPlayer({
             className={`viewer-overlay fixed inset-0 z-[200] animate-in fade-in duration-150 ${isFullscreen ? 'p-0' : 'flex items-center justify-center p-4'}`}
             onClick={onClose}
         >
-            <div ref={containerRef} className={`relative ${isFullscreen ? 'fixed inset-0 w-screen h-screen max-w-none' : 'w-full max-w-6xl flex flex-col items-center'}`} onClick={e => e.stopPropagation()}>
+            <div ref={containerRef} className={`relative ${isFullscreen ? 'fixed inset-0 w-screen h-screen max-w-none' : 'media-viewer-shell w-full max-w-6xl flex flex-col items-center'}`} onClick={e => e.stopPropagation()}>
                 {/* Nav buttons */}
-                <button onClick={onPrev} className={`viewer-navigation absolute start-2 top-1/2 z-10 -translate-y-1/2 ${isFullscreen ? 'start-4' : ''}`} title="Previous (ArrowLeft / J)" aria-label="Previous file">
+                <button onClick={onPrev} className={`viewer-navigation absolute start-2 top-1/2 z-10 -translate-y-1/2 ${isFullscreen ? 'start-4' : ''}`} title={i18n.t('viewer.previous_shortcut')} aria-label={i18n.t('viewer.previous_file')}>
                     <ChevronLeft className="h-5 w-5 rtl:rotate-180" />
                 </button>
-                <button onClick={onNext} className={`viewer-navigation absolute end-2 top-1/2 z-10 -translate-y-1/2 ${isFullscreen ? 'end-4' : ''}`} title="Next (ArrowRight / L)" aria-label="Next file">
+                <button onClick={onNext} className={`viewer-navigation absolute end-2 top-1/2 z-10 -translate-y-1/2 ${isFullscreen ? 'end-4' : ''}`} title={i18n.t('viewer.next_shortcut')} aria-label={i18n.t('viewer.next_file')}>
                     <ChevronRight className="h-5 w-5 rtl:rotate-180" />
                 </button>
-                <div className={`viewer-toolbar absolute z-30 ${isFullscreen ? 'end-4 top-4' : '-top-10 end-0'}`}>
+                <div className={`viewer-toolbar z-30 ${isFullscreen ? 'absolute end-4 top-4' : 'relative mb-2 self-end shrink-0'}`}>
                     <button
                         onClick={toggleFullscreen}
                         className="viewer-control"
-                        title={isFullscreen ? 'Exit fullscreen (F)' : 'Fullscreen (F)'}
-                        aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+                        title={isFullscreen ? i18n.t('viewer.exit_fullscreen_shortcut') : i18n.t('viewer.fullscreen_shortcut')}
+                        aria-label={isFullscreen ? i18n.t("workspace.exit_fullscreen") : i18n.t('viewer.enter_fullscreen')}
                     >
                         {isFullscreen ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
                     </button>
                     <button
                         onClick={onClose}
                         className="viewer-control"
-                        title="Close (Esc)"
-                        aria-label="Close media player"
+                        title={i18n.t('viewer.close_shortcut')}
+                        aria-label={i18n.t('viewer.close_player')}
                     >
                         <X className="w-5 h-5" />
                     </button>
                 </div>
 
                 {/* Video container */}
-                <div className={`relative flex items-center justify-center overflow-hidden bg-black ${isFullscreen ? 'h-full w-full rounded-none shadow-none' : 'viewer-panel aspect-video w-full'}`}>
+                <div className={`relative flex items-center justify-center overflow-hidden bg-black ${isFullscreen ? 'h-full w-full rounded-none shadow-none' : 'viewer-panel media-viewer-stage aspect-video w-full'}`}>
                     {/* fMP4 remux loading overlay */}
                     {fmp4Remuxing && !useFallback && !playbackConfirmed && (
                         <div className="flex flex-col items-center gap-4 text-white absolute inset-0 bg-black/80 z-10">
@@ -998,8 +1000,8 @@ export function AdaptiveMediaPlayer({
                     {(isHlsMode || !playbackConfirmed) && (displayPhase === 'error' || displayPhase === 'failed') && (
                         <div className="flex flex-col items-center gap-3 text-white px-8">
                             <AlertTriangle className="w-10 h-10 text-red-400" />
-                            <p className="text-sm text-red-400 font-medium">Playback Error</p>
-                            <p className="text-xs text-white/40 text-center max-w-md">{displayError || 'Unknown error'}</p>
+                            <p className="text-sm text-red-400 font-medium">{i18n.t('viewer.playback_error')}</p>
+                            <p className="text-xs text-white/40 text-center max-w-md">{displayError || i18n.t('transfer_copy.unknown_error')}</p>
                             {isHlsMode && (
                                 <button onClick={retryTranscode} className="mt-2 flex items-center gap-2 px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg text-xs font-medium transition-colors">
                                     <RefreshCw className="w-3.5 h-3.5" />
@@ -1045,7 +1047,7 @@ export function AdaptiveMediaPlayer({
                         <div className="flex flex-col items-center gap-4 text-white absolute inset-0 bg-black/80 z-10">
                             <Loader2 className="w-10 h-10 text-telegram-primary animate-spin" />
                             <div className="flex flex-col items-center gap-1">
-                                <p className="text-sm font-medium">Loading video</p>
+                                <p className="text-sm font-medium">{i18n.t('viewer.loading_video')}</p>
                                 {loadProgress > 0 && (
                                     <div className="flex items-center gap-2">
                                         <div className="w-32 h-1.5 bg-white/10 rounded-full overflow-hidden">
@@ -1103,81 +1105,82 @@ export function AdaptiveMediaPlayer({
                             className={`w-full h-full object-contain ${(isMseLoading || msePhase === 'error') ? 'opacity-0' : 'opacity-100'}`}
                         />
                     )}
-                </div>
 
-                {/* Quality overlay badge on video */}
-                {(displayPhase === 'playing' || displayPhase === 'ready') && (
-                    <div className={`absolute ${isFullscreen ? 'bottom-16 left-4' : 'top-3 right-3'} z-20 flex items-center gap-2`}>
-                        {/* Quality / mode badge */}
-                        <div className="px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-sm border border-white/10 text-xs font-medium text-white/90 shadow-lg pointer-events-none">
-                            {isHlsMode && hlsQuality ? QUALITY_LABELS[hlsQuality] : `${effectiveQuality === 'original' ? 'Original' : QUALITY_LABELS[effectiveQuality]}${measuredKbps > 0 && effectiveQuality !== 'original' ? ` · ${(measuredKbps / 1000).toFixed(0)}k` : ''}`}
-                        </div>
-                        {/* Resolution badge */}
-                        {(sourceResolution || playingResolution) && (
-                            <div className="px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-sm border border-white/10 text-[10px] font-medium text-white/70 shadow-lg pointer-events-none flex items-center gap-1.5">
-                                {sourceResolution && (
-                                    <span>Source: {sourceResolution.w}×{sourceResolution.h}</span>
-                                )}
-                                {playingResolution && (!sourceResolution || playingResolution.w !== sourceResolution.w || playingResolution.h !== sourceResolution.h) && (
-                                    <span>· Playing: {playingResolution.w}×{playingResolution.h}</span>
-                                )}
+                    {/* Quality and diagnostics stay anchored to the video stage. */}
+                    {(displayPhase === 'playing' || displayPhase === 'ready') && (
+                        <div className={`absolute ${isFullscreen ? 'bottom-16 left-4' : 'top-3 end-3'} z-20 flex max-w-[calc(100%_-_1.5rem)] flex-wrap items-center justify-end gap-2`}>
+                            {/* Quality / mode badge */}
+                            <div className="px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-sm border border-white/10 text-xs font-medium text-white/90 shadow-lg pointer-events-none">
+                                {isHlsMode && hlsQuality ? qualityLabel(hlsQuality, i18n.t('settings.original')) : `${qualityLabel(effectiveQuality, i18n.t('settings.original'))}${measuredKbps > 0 && effectiveQuality !== 'original' ? ` · ${(measuredKbps / 1000).toFixed(0)}k` : ''}`}
                             </div>
-                        )}
-                    </div>
-                )}
-
-                {/* Debug overlay (lower-left, toggle with D key) */}
-                {debugOverlay && (
-                    <div className={`absolute z-40 pointer-events-none ${isFullscreen ? 'bottom-20 left-4' : 'bottom-4 left-4'}`}>
-                        <div className="px-3 py-2 rounded-lg bg-black/80 backdrop-blur-sm border border-white/10 text-[10px] font-mono text-white/80 shadow-xl space-y-1">
-                            <div className="flex items-center gap-2 text-[11px] font-semibold text-white/60 mb-0.5">
-                                <Activity className="w-3 h-3" />
-                                Debug
-                            </div>
-                            <div className="flex justify-between gap-4">
-                                <span className="text-white/40">Speed</span>
-                                <span>{isHlsMode ? '—' : measuredKbps > 999 ? `${(measuredKbps / 1000).toFixed(1)} Mbps` : `${Math.round(measuredKbps)} Kbps`}</span>
-                            </div>
-                            <div className="flex justify-between gap-4">
-                                <span className="text-white/40">Cap</span>
-                                <span>{effectiveQuality === 'original' ? 'Unlimited' : `${QUALITY_LABELS[effectiveQuality]}${!transcodeCapabilities?.available ? ' (throttle)' : ''}`}</span>
-                            </div>
-                            <div className="flex justify-between gap-4">
-                                <span className="text-white/40">Buffered</span>
-                                <span>{debugBufferedSecs.toFixed(1)}s</span>
-                            </div>
-                            <div className="flex justify-between gap-4">
-                                <span className="text-white/40">Mode</span>
-                                <span className={isHlsMode ? 'text-emerald-400' : effectiveQuality !== 'original' && !transcodeCapabilities?.available ? 'text-amber-400' : 'text-white/60'}>
-                                    {isHlsMode ? 'HLS' : effectiveQuality !== 'original' && !transcodeCapabilities?.available ? 'Bandwidth capped' : 'Original'}
-                                </span>
-                            </div>
+                            {/* Resolution badge */}
                             {(sourceResolution || playingResolution) && (
-                                <div className="flex justify-between gap-4">
-                                    <span className="text-white/40">{i18n.t("common.size")}</span>
-                                    <span>
-                                        {playingResolution ? `${playingResolution.w}×${playingResolution.h}` : ''}
-                                        {playingResolution && sourceResolution && (playingResolution.w !== sourceResolution.w || playingResolution.h !== sourceResolution.h)
-                                            ? ` (src: ${sourceResolution.w}×${sourceResolution.h})`
-                                            : sourceResolution ? ` ${sourceResolution.w}×${sourceResolution.h}` : ''}
-                                    </span>
+                                <div className="px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-sm border border-white/10 text-[10px] font-medium text-white/70 shadow-lg pointer-events-none flex items-center gap-1.5">
+                                    {sourceResolution && (
+                                        <span>{i18n.t('viewer.source')} {sourceResolution.w}×{sourceResolution.h}</span>
+                                    )}
+                                    {playingResolution && (!sourceResolution || playingResolution.w !== sourceResolution.w || playingResolution.h !== sourceResolution.h) && (
+                                        <span>{i18n.t('viewer.playing')} {playingResolution.w}×{playingResolution.h}</span>
+                                    )}
                                 </div>
                             )}
-                            {/* Clear transcode cache button */}
-                            <div className="pt-1.5 mt-1 border-t border-white/5">
-                                <button
-                                    onClick={handleClearTranscodeCache}
-                                    disabled={clearingCache}
-                                    className="pointer-events-auto flex items-center gap-1.5 text-[9px] text-red-400/60 hover:text-red-400 transition-colors disabled:opacity-50"
-                                    title={`Clear all transcoded HLS variants for ${file.name}`}
-                                >
-                                    <Trash2 className="w-3 h-3" />
-                                    {clearingCache ? 'Clearing...' : 'Clear Transcodes'}
-                                </button>
+                        </div>
+                    )}
+
+                    {/* Debug overlay (lower-left, toggle with D key) */}
+                    {debugOverlay && (
+                        <div className={`absolute z-40 pointer-events-none ${isFullscreen ? 'bottom-20 left-4' : 'bottom-4 left-4'}`}>
+                            <div className="px-3 py-2 rounded-lg bg-black/80 backdrop-blur-sm border border-white/10 text-[10px] font-mono text-white/80 shadow-xl space-y-1">
+                                <div className="flex items-center gap-2 text-[11px] font-semibold text-white/60 mb-0.5">
+                                    <Activity className="w-3 h-3" />
+                                    {i18n.t('viewer.debug')}
+                                </div>
+                                <div className="flex justify-between gap-4">
+                                    <span className="text-white/40">{i18n.t("playback.speed")}</span>
+                                    <span>{isHlsMode ? '—' : measuredKbps > 999 ? `${(measuredKbps / 1000).toFixed(1)} Mbps` : `${Math.round(measuredKbps)} Kbps`}</span>
+                                </div>
+                                <div className="flex justify-between gap-4">
+                                    <span className="text-white/40">{i18n.t('viewer.cap')}</span>
+                                    <span>{effectiveQuality === 'original' ? i18n.t("settings.unlimited") : `${qualityLabel(effectiveQuality, i18n.t('settings.original'))}${!transcodeCapabilities?.available ? ' (throttle)' : ''}`}</span>
+                                </div>
+                                <div className="flex justify-between gap-4">
+                                    <span className="text-white/40">{i18n.t('viewer.buffered')}</span>
+                                    <span>{debugBufferedSecs.toFixed(1)}s</span>
+                                </div>
+                                <div className="flex justify-between gap-4">
+                                    <span className="text-white/40">{i18n.t('viewer.mode')}</span>
+                                    <span className={isHlsMode ? 'text-emerald-400' : effectiveQuality !== 'original' && !transcodeCapabilities?.available ? 'text-amber-400' : 'text-white/60'}>
+                                        {isHlsMode ? 'HLS' : effectiveQuality !== 'original' && !transcodeCapabilities?.available ? 'Bandwidth capped' : i18n.t("settings.original")}
+                                    </span>
+                                </div>
+                                {(sourceResolution || playingResolution) && (
+                                    <div className="flex justify-between gap-4">
+                                        <span className="text-white/40">{i18n.t("common.size")}</span>
+                                        <span>
+                                            {playingResolution ? `${playingResolution.w}×${playingResolution.h}` : ''}
+                                            {playingResolution && sourceResolution && (playingResolution.w !== sourceResolution.w || playingResolution.h !== sourceResolution.h)
+                                                ? ` (src: ${sourceResolution.w}×${sourceResolution.h})`
+                                                : sourceResolution ? ` ${sourceResolution.w}×${sourceResolution.h}` : ''}
+                                        </span>
+                                    </div>
+                                )}
+                                {/* Clear transcode cache button */}
+                                <div className="pt-1.5 mt-1 border-t border-white/5">
+                                    <button
+                                        onClick={handleClearTranscodeCache}
+                                        disabled={clearingCache}
+                                        className="pointer-events-auto flex items-center gap-1.5 text-[9px] text-red-400/60 hover:text-red-400 transition-colors disabled:opacity-50"
+                                        title={`Clear all transcoded HLS variants for ${file.name}`}
+                                    >
+                                        <Trash2 className="w-3 h-3" />
+                                        {clearingCache ? i18n.t("settings.clearing") : 'Clear Transcodes'}
+                                    </button>
+                                </div>
                             </div>
                         </div>
-                    </div>
-                )}
+                    )}
+
+                </div>
 
                 {/* Fullscreen overlay toolbar */}
                 {isFullscreen && (displayPhase !== 'error' && displayPhase !== 'failed') && (
@@ -1191,7 +1194,7 @@ export function AdaptiveMediaPlayer({
                                         if (video) video.paused ? video.play().catch(() => {}) : video.pause();
                                     }}
                                     className="viewer-control text-white/80"
-                                    title="Play/Pause (Space)"
+                                    title={i18n.t('viewer.play_pause_shortcut')}
                                 >
                                     <Play className="w-5 h-5" />
                                 </button>
@@ -1201,7 +1204,7 @@ export function AdaptiveMediaPlayer({
                                     onMouseEnter={() => setShowVolumeSlider(true)}
                                     onMouseLeave={() => setShowVolumeSlider(false)}
                                 >
-                                    <button onClick={toggleMute} className="viewer-control text-white/60" title={isMuted ? 'Unmute' : 'Mute'}>
+                                    <button onClick={toggleMute} className="viewer-control text-white/60" title={isMuted ? i18n.t('viewer.unmute') : i18n.t('viewer.mute')}>
                                         {isMuted || volume === 0 ? <VolumeX className="w-4 h-4" /> : volume < 0.5 ? <Volume1 className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
                                     </button>
                                     <div className={`overflow-hidden transition-all duration-200 ${showVolumeSlider ? 'w-20 opacity-100' : 'w-0 opacity-0'}`}>
@@ -1238,8 +1241,8 @@ export function AdaptiveMediaPlayer({
                                 <button
                                     onClick={exitFullscreen}
                                     className="viewer-control"
-                                    title="Exit fullscreen (F)"
-                                    aria-label="Exit fullscreen"
+                                    title={i18n.t('viewer.exit_fullscreen_shortcut')}
+                                    aria-label={i18n.t("workspace.exit_fullscreen")}
                                 >
                                     <Minimize2 className="w-5 h-5" />
                                 </button>
@@ -1248,8 +1251,8 @@ export function AdaptiveMediaPlayer({
                                 <button
                                     onClick={onClose}
                                     className="viewer-control"
-                                    title="Close (Esc)"
-                                    aria-label="Close media player"
+                                    title={i18n.t('viewer.close_shortcut')}
+                                    aria-label={i18n.t('viewer.close_player')}
                                 >
                                     <X className="w-5 h-5" />
                                 </button>
@@ -1259,12 +1262,12 @@ export function AdaptiveMediaPlayer({
                 )}
 
                 {/* Bottom bar: file info + volume + quality selector (non-fullscreen) */}
-                {!isFullscreen && <div className="mt-3 w-full flex items-center justify-between px-1 gap-3">
+                {!isFullscreen && <div className="media-viewer-file-info w-full flex items-center justify-between gap-3">
                     <div className="min-w-0 flex-1 text-start">
-                        <h3 className="max-w-md truncate text-ui font-medium text-white" title={file.name}>{file.name}</h3>
+                        <h3 className="truncate text-ui font-medium text-white" title={file.name}>{file.name}</h3>
                         <p className="flex items-center gap-2 text-badge text-white/40">
                             {isHlsMode && hlsQuality && (
-                                <span className="text-telegram-primary">{QUALITY_LABELS[hlsQuality]}</span>
+                                <span className="text-telegram-primary">{qualityLabel(hlsQuality, i18n.t('settings.original'))}</span>
                             )}
                             {hasVideoTrack && !isHlsMode && tracks.find(t => t.type === 'video') && (
                                 <span>
@@ -1288,7 +1291,7 @@ export function AdaptiveMediaPlayer({
                                     ? 'text-amber-400 bg-amber-500/10 border-amber-500/20'
                                     : 'text-white/40 bg-white/5 border-white/10'
                         }`}>
-                            {isHlsMode ? 'HLS' : effectiveQuality !== 'original' && !transcodeCapabilities?.available ? 'Throttled' : 'Original'}
+                            {isHlsMode ? 'HLS' : effectiveQuality !== 'original' && !transcodeCapabilities?.available ? 'Throttled' : i18n.t("settings.original")}
                         </span>
                     {!useFallback && displayPhase !== 'error' && displayPhase !== 'failed' && (
                         <QualitySelector
@@ -1312,24 +1315,24 @@ export function AdaptiveMediaPlayer({
                 {!isFullscreen && playback && <PlaybackControls playback={playback} />}
 
                 {/* Keyboard shortcut hints */}
-                {!isFullscreen && <div className="mt-2 flex items-center gap-4 text-[10px] text-white/25 select-none">
+                {!isFullscreen && <div className="media-viewer-shortcuts flex flex-wrap items-center justify-center text-[10px] text-white/40 select-none">
                     <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">← →</kbd> Navigate
+                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">← →</kbd> {i18n.t('viewer.navigate')}
                     </span>
                     <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">Space</kbd> Play/Pause
+                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">{i18n.t('viewer.space')}</kbd> {i18n.t('viewer.play_pause')}
                     </span>
                     <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">F</kbd> Fullscreen
+                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">F</kbd> {i18n.t("workspace.fullscreen")}
                     </span>
                     <span className="flex items-center gap-1">
                         <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">Esc</kbd> {i18n.t("common.close")}
                     </span>
                     <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">M</kbd> Mute
+                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">M</kbd> {i18n.t('viewer.mute')}
                     </span>
                     <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">D</kbd> Debug
+                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">D</kbd> {i18n.t('viewer.debug')}
                     </span>
                 </div>}
             </div>

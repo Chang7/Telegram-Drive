@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Download, FolderOpen, Pause, Play, RefreshCw, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { actOnOfflinePack, createOfflinePack, offlinePackMessages, offlinePackPath, offlinePackTotals, readOfflinePacks, type OfflinePack, type OfflinePackAction, type OfflinePackSnapshot } from '../../services/offlinePacks';
+import { actOnOfflinePack, createOfflinePack, type OfflinePackMessageKey, offlinePackPath, offlinePackTotals, readOfflinePacks, type OfflinePack, type OfflinePackAction, type OfflinePackSnapshot } from '../../services/offlinePacks';
 import type { WorkspaceFile } from '../../services/workspace';
 import { formatBytes } from '../../utils';
 
@@ -16,7 +16,7 @@ const control = 'min-h-11 rounded-xl border border-telegram-border bg-telegram-s
 
 export function OfflinePacksPanel({ ownerId, selectedFiles, collectionName, onOpen }: OfflinePacksPanelProps) {
   const { t } = useTranslation();
-  const text = (key: keyof typeof offlinePackMessages, values?: Record<string, string | number>) => t(`offlinePacks.${key}`, { defaultValue: offlinePackMessages[key], ...values });
+  const text = (key: OfflinePackMessageKey, values?: Record<string, string | number>) => t(`offlinePacks.${key}`, values);
   const [snapshot, setSnapshot] = useState<OfflinePackSnapshot | null>(null);
   const [name, setName] = useState(collectionName || text('default_name'));
   const [wifiOnly, setWifiOnly] = useState(true);
@@ -61,7 +61,7 @@ export function OfflinePacksPanel({ ownerId, selectedFiles, collectionName, onOp
     finally { if (isCurrent()) setBusy(null); }
   };
   const packAction = (pack: OfflinePack, action: OfflinePackAction, fileKey?: string) => void perform(pack.id, () => actOnOfflinePack(ownerId, pack.id, action, fileKey));
-  const status = (value: string) => text((value === 'error' ? 'failed' : value) as keyof typeof offlinePackMessages);
+  const status = (value: string) => text((value === 'error' ? 'failed' : value) as OfflinePackMessageKey);
   const waiting = (reason: string | null) => text(reason === 'WAITING_FOR_WIFI' ? 'waiting_wifi' : reason === 'WAITING_FOR_STORAGE' ? 'waiting_storage' : reason === 'NETWORK_STATUS_UNKNOWN' ? 'network_unknown' : 'waiting_network');
 
   return <section className="space-y-4" aria-label={text('title')}>
@@ -77,7 +77,7 @@ export function OfflinePacksPanel({ ownerId, selectedFiles, collectionName, onOp
       {data && required + data.reserveBytes > data.freeBytes && <p className="text-xs text-amber-400">{text('low_space')}</p>}
       {protectedFiles && <p className="text-xs text-amber-400">{text('protected_note')}</p>}
       <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={wifiOnly} onChange={event => setWifiOnly(event.target.checked)} />{text('wifi_only')}</label>
-      <label className="flex flex-wrap items-center gap-2 text-sm">{text('expires')}<select value={expiryDays} onChange={event => setExpiryDays(Number(event.target.value))} className={control}><option value={0}>{text('never')}</option>{[7, 14, 30, 90].map(days => <option key={days} value={days}>{text('days', { count: days })}</option>)}</select></label>
+      <label className="flex flex-wrap items-center gap-2 text-sm">{text('expires')}<select value={expiryDays} onChange={event => setExpiryDays(Number(event.target.value))} className={`app-select ${control}`}><option value={0}>{text('never')}</option>{[7, 14, 30, 90].map(days => <option key={days} value={days}>{text('days', { count: days })}</option>)}</select></label>
       <p className="text-xs text-telegram-subtext">{text('expiry_note')}</p>
       <button disabled={busy !== null || !files.length || !name.trim()} className={`${control} flex items-center gap-2 text-telegram-primary`}><Download className="h-4 w-4" />{text(busy === 'create' ? 'creating' : 'download')}</button>
     </form>

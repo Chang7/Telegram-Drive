@@ -39,9 +39,9 @@ export function UpdateBanner({
 
                         <span className="text-white font-medium">
                             {downloading ? (
-                                <>{phase === 'verifying' ? 'Verifying signed update…' : phase === 'installing' ? 'Installing update…' : `Downloading update… ${progress}%`}</>
+                                <>{phase === 'verifying' ? t('runtime.update_verifying') : phase === 'installing' ? t('runtime.update_installing') : t('runtime.update_downloading', {percent: progress})}</>
                             ) : (
-                                <>A new version ({version}) is available!</>
+                                <>{t('runtime.update_available', {version})}</>
                             )}
                         </span>
 
@@ -62,7 +62,7 @@ export function UpdateBanner({
                                 className="flex items-center gap-2 px-4 py-1.5 bg-white text-telegram-primary font-semibold rounded-full hover:bg-white/90 transition-colors shadow-md"
                             >
                                 <Download className="w-4 h-4" />
-                                {managedByPackageManager ? t('common.open') : t('settings.update_restart')}
+                                {managedByPackageManager ? t('files.open') : t('settings.update_restart')}
                             </button>
                         )}
 

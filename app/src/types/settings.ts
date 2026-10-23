@@ -2,7 +2,18 @@ import type { LanguagePreference } from '../i18n/languages';
 
 export type VideoUploadMode = 'file' | 'media';
 
+export interface BandwidthWindow {
+  days: number[];
+  start_minute: number;
+  end_minute: number;
+  up_kbs: number;
+  down_kbs: number;
+  pause: boolean;
+}
+
 export interface Settings {
+  bandwidth_schedule: boolean;
+  bandwidthWindows: BandwidthWindow[];
   viewMode: 'grid' | 'list';
   fileSortField: 'name' | 'size' | 'date';
   fileSortDirection: 'asc' | 'desc';
@@ -11,6 +22,7 @@ export interface Settings {
   maxConcurrentDownloads: number;
   zipFolders: boolean;
   videoUploadMode: VideoUploadMode;
+  videoFilenameCaption: boolean;
   language: LanguagePreference;
   crashReportingEnabled: boolean;
   crashReportingConsentSeen: boolean;
@@ -19,6 +31,8 @@ export interface Settings {
   supporterPromptLastShownAt: number;
   driveTourSeen: boolean;
   vaultRecoveryDrillCompleted: boolean;
+  /** Vault the completed drill was run against; empty for drills recorded before 4.0. */
+  vaultRecoveryDrillVaultId: string;
   webdavPermissionExplained: boolean;
   restPermissionExplained: boolean;
   downloadWebdavTipSeen: boolean;

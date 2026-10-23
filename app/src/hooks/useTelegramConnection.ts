@@ -1,3 +1,4 @@
+import i18n from '../i18n';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { load, type Store } from '@tauri-apps/plugin-store';
@@ -5,7 +6,7 @@ import { toast } from 'sonner';
 import { useConfirm } from '../context/ConfirmContext';
 import { TelegramFolder, FolderInviteInfo, FolderGroup } from '../types';
 import { useNetworkStatus } from './useNetworkStatus';
-import { clearImageMemoryCaches } from '../services/imagePreviewCache';
+import { clearImageMemoryCaches, setImageCacheAccount } from '../services/imagePreviewCache';
 import { userFacingError } from '../services/userFacingError';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
@@ -24,19 +25,45 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     const [isConnected, setIsConnected] = useState(true);
     const [accountId, setAccountId] = useState<string | null>(null);
     const accountGeneration = useRef(0);
-    useEffect(() => {
-        const refresh = () => {
-            const generation = ++accountGeneration.current;
-            void getCurrentAccountId().then(id => {
-                if (generation === accountGeneration.current) setAccountId(id);
-            }).catch(() => {
-                if (generation === accountGeneration.current) setAccountId(null);
-            });
+    const logoutInProgress = useRef(false);
+    const accountRetryTimer = useRef<number | undefined>(undefined);
+    const refreshAccountId = useCallback(async () => {
+        if (logoutInProgress.current) return null;
+        window.clearTimeout(accountRetryTimer.current);
+        const generation = ++accountGeneration.current;
+        const read = async (attempt: number): Promise<string | null> => {
+            if (generation !== accountGeneration.current) return null;
+            try {
+                const id = await getCurrentAccountId();
+                if (generation !== accountGeneration.current) return null;
+                setImageCacheAccount(id);
+                setAccountId(id);
+                return id;
+            } catch (error) {
+                if (generation !== accountGeneration.current) return null;
+                setImageCacheAccount(null);
+                setAccountId(null);
+                // A busy session database must not disable every file query
+                // until a window visibility change. Never infer an owner or
+                // retry an explicit signed-out/account-change response.
+                if (attempt < 2 && !/ACCOUNT_(?:REQUIRED|CHANGED)/.test(String(error))) {
+                    accountRetryTimer.current = window.setTimeout(() => { void read(attempt + 1); }, 1000 * (attempt + 1));
+                }
+                return null;
+            }
         };
+        return read(0);
+    }, []);
+    useEffect(() => {
+        const refresh = () => { void refreshAccountId(); };
         refresh();
         document.addEventListener('visibilitychange', refresh);
-        return () => { accountGeneration.current++; document.removeEventListener('visibilitychange', refresh); };
-    }, []);
+        return () => {
+            accountGeneration.current++;
+            window.clearTimeout(accountRetryTimer.current);
+            document.removeEventListener('visibilitychange', refresh);
+        };
+    }, [refreshAccountId]);
 
     const networkIsOnline = useNetworkStatus();
     const handleSyncFoldersRef = useRef<((silentParam?: boolean | unknown) => Promise<void>) | null>(null);
@@ -161,28 +188,53 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     }, [networkIsOnline]);
 
     const handleLogout = async () => {
-        if (!await confirm({ title: "Sign Out", message: "Are you sure you want to sign out? This will disconnect your active session.", confirmText: "Sign Out", variant: 'danger' })) return;
-
+        if (logoutInProgress.current) return;
+        logoutInProgress.current = true;
+        let progress: string | number | undefined;
+        let signedOut = false;
         try {
+            if (!await confirm({ title: i18n.t('common.sign_out'), message: "Are you sure you want to sign out? This will disconnect your active session.", confirmText: i18n.t('common.sign_out'), variant: 'danger' })) return;
+            progress = toast.loading(t('common.logout'), { description: t('common.loading') });
+            // Ignore an account lookup that was already running when sign-out
+            // began, but retain the current identity unless native logout succeeds.
             accountGeneration.current++;
-            setAccountId(null);
-            await invoke('cmd_logout');
-            queryClient.clear();
-            await invoke('cmd_clean_cache');
-            await invoke('cmd_clear_api_hash').catch((error) => {
-                toast.error(userFacingError(error, t));
-            });
-            clearImageMemoryCaches();
-            if (store) {
-                await store.delete('api_id');
-                await store.delete('api_hash');
-                await store.delete('folders');
-                await store.save();
+            window.clearTimeout(accountRetryTimer.current);
+            const outcome = await invoke<boolean | { signed_out?: boolean; remote_session_revoked?: boolean }>('cmd_logout');
+            const completed = outcome === true || (typeof outcome === 'object' && outcome?.signed_out === true);
+            if (!completed) throw new Error('Logout did not complete');
+            signedOut = true;
+            if (typeof outcome === 'object' && outcome?.remote_session_revoked === false) {
+                // Local data is cleared either way; the user has to end the
+                // session from another Telegram client when Telegram did not confirm.
+                toast.warning(t('common.signout_remote_unconfirmed'), { duration: 12_000 });
             }
-            onLogoutParent();
-        } catch {
-            toast.error("Error signing out");
-            onLogoutParent();
+            accountGeneration.current++;
+            setImageCacheAccount(null);
+            setAccountId(null);
+            queryClient.clear();
+            clearImageMemoryCaches();
+            // Legacy installs can read either store. Remove only the Telegram
+            // sign-in fields, never unrelated settings or supporter credentials.
+            const cleanup = await Promise.allSettled([
+                invoke('cmd_clean_cache'),
+                invoke('cmd_clear_api_hash'),
+                ...['config.json', 'settings.json'].map(async path => {
+                    const target = await load(path);
+                    const removals = await Promise.allSettled(['api_id', 'api_hash', 'folders'].map(key => target.delete(key)));
+                    await target.save();
+                    if (removals.some(result => result.status === 'rejected')) throw new Error('Sign-in field cleanup failed');
+                }),
+            ]);
+            if (cleanup.some(result => result.status === 'rejected')) {
+                toast.warning('Signed out, but some local cleanup could not finish.');
+            }
+        } catch (error) {
+            if (signedOut) toast.warning('Signed out, but some local cleanup could not finish.');
+            else toast.error(userFacingError(error, t));
+        } finally {
+            if (progress !== undefined) toast.dismiss(progress);
+            logoutInProgress.current = false;
+            if (signedOut) onLogoutParent();
         }
     };
 
@@ -191,6 +243,7 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         if (!store) return;
         setIsSyncing(true);
         try {
+            await refreshAccountId();
             const foundFolders = await invoke<TelegramFolder[]>('cmd_scan_folders');
             setFolders(foundFolders);
             await store.set('folders', foundFolders);
@@ -231,7 +284,7 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         if (!await confirm({
             title: "Delete Folder",
             message: `Are you sure you want to delete "${folderName}"?\nThis will delete the channel on Telegram.`,
-            confirmText: "Delete",
+            confirmText: i18n.t("files.delete"),
             variant: 'danger'
         })) return;
 
@@ -289,9 +342,9 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     const handleFolderToggleVisibility = async (folderId: number, makePublic: boolean, desiredUsername?: string) => {
         if (!makePublic) {
             const confirmed = await confirm({
-                title: "Make Private",
+                title: i18n.t("files.make_private"),
                 message: "Making this channel private will remove its public username. Any shared t.me links will stop working immediately.",
-                confirmText: "Make Private",
+                confirmText: i18n.t("files.make_private"),
                 variant: 'danger'
             });
             if (!confirmed) return;

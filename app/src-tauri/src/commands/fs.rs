@@ -1,6 +1,4 @@
 use crate::bandwidth::{BandwidthManager, BandwidthReservation};
-#[cfg(test)]
-use crate::commands::download_destination::replace_download_file;
 use crate::commands::download_destination::{
     publish_download_file, skip_existing_download, DownloadCollisionPolicy, DownloadOutcome,
 };
@@ -15,10 +13,16 @@ use crate::crypto::registry::{upsert_encrypted_file, EncryptedFileRecord, Encryp
 use crate::crypto::secret::{SecretBytes, SecretKey};
 use crate::db::DbConnection;
 use crate::models::{FileMetadata, FolderMetadata};
+use crate::resumable_upload::{
+    parts_unusable, session_key, ResumableUpload, SourceFingerprint, TelegramSink, UploadError,
+    RESUMABLE_FROM_BYTES,
+};
 use crate::vpn_optimizer::{backoff_ms, NetworkConfig};
 use crate::TelegramState;
 use base64::Engine;
-use grammers_client::types::{Attribute, Media, Peer};
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use grammers_client::types::Attribute;
+use grammers_client::types::{Media, Peer};
 use grammers_client::InputMessage;
 use grammers_tl_types as tl;
 use serde::{Deserialize, Serialize};
@@ -73,6 +77,12 @@ struct ProtectedFileMetadata<'a> {
     schema_version: u16,
     original_name: &'a str,
     mime_type: &'a str,
+    /// Where Folder Sync keeps this file, relative to its mapped folder. A
+    /// protected file's caption and remote name say nothing about it, so the
+    /// path travels inside the encrypted metadata. Earlier releases ignore
+    /// the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_path: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +90,46 @@ struct DecodedProtectedFileMetadata {
     schema_version: u16,
     original_name: String,
     mime_type: String,
+    #[serde(default)]
+    sync_path: Option<String>,
+}
+
+/// What Folder Sync needs to place a protected file it has no record of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProtectedSyncMetadata {
+    /// `None` when the file was not uploaded by Folder Sync.
+    pub sync_path: Option<String>,
+    pub plaintext_size: u64,
+}
+
+/// Read a protected file's sync path from its envelope header with the vault
+/// key. A file the vault cannot open was not uploaded by Folder Sync, which
+/// only ever uses the vault.
+pub(crate) fn protected_sync_metadata(
+    header: &[u8],
+    vault_key: &SecretKey,
+) -> Result<ProtectedSyncMetadata, String> {
+    let parsed = EnvelopeHeader::parse(header).map_err(|error| error.to_string())?;
+    let plaintext_size = parsed.core.total_plaintext_length;
+    let not_synced = ProtectedSyncMetadata {
+        sync_path: None,
+        plaintext_size,
+    };
+    let Ok(reader) = initialize_tdenc2_decryptor(header, Some(vault_key), None) else {
+        return Ok(not_synced);
+    };
+    let Ok(metadata) =
+        serde_json::from_slice::<DecodedProtectedFileMetadata>(reader.metadata_plaintext())
+    else {
+        return Ok(not_synced);
+    };
+    if metadata.schema_version != 1 {
+        return Ok(not_synced);
+    }
+    Ok(ProtectedSyncMetadata {
+        sync_path: metadata.sync_path,
+        plaintext_size,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +156,8 @@ impl VideoUploadMode {
     }
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[derive(Clone, Copy)]
 struct VideoUploadMetadata {
     duration: std::time::Duration,
     width: i32,
@@ -113,6 +165,7 @@ struct VideoUploadMetadata {
     mime_type: &'static str,
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
 fn is_mp4_family_video(path: &str) -> bool {
     matches!(
         std::path::Path::new(path)
@@ -125,6 +178,7 @@ fn is_mp4_family_video(path: &str) -> bool {
     )
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
 async fn prepare_video_upload_metadata(
     source_path: &str,
     upload_name: &str,
@@ -185,6 +239,29 @@ async fn prepare_video_upload_metadata(
         height: i32::try_from(parsed.2).unwrap_or(i32::MAX),
         mime_type: inferred_mime_type(upload_name),
     }))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn prepare_video_upload_metadata(
+    source: &str,
+    name: &str,
+    mode: VideoUploadMode,
+    account: &crate::workspace::AccountGuard,
+    cancel: &mut oneshot::Receiver<()>,
+    resource: Option<std::path::PathBuf>,
+    bandwidth: Arc<BandwidthManager>,
+) -> Result<Option<crate::desktop_video_upload::VideoUploadMetadata>, String> {
+    crate::desktop_video_upload::prepare_for_account(
+        source,
+        name,
+        mode == VideoUploadMode::Media,
+        inferred_mime_type(name),
+        resource,
+        bandwidth,
+        account,
+        cancel,
+    )
+    .await
 }
 
 impl UploadProtectionMode {
@@ -276,7 +353,7 @@ fn registry_record_from_header(
     })
 }
 
-async fn probe_tdenc2_header(
+pub(crate) async fn probe_tdenc2_header(
     account: &crate::workspace::AccountGuard,
     client: &grammers_client::Client,
     media: &Media,
@@ -309,6 +386,25 @@ pub(crate) async fn resolve_remote_envelope(
     media: &Media,
     caption: &str,
 ) -> Result<Option<EncryptedFileRecord>, String> {
+    resolve_remote_envelope_with_probe(
+        account,
+        folder_id,
+        message_id,
+        media,
+        caption,
+        probe_tdenc2_header(account, client, media),
+    )
+    .await
+}
+
+async fn resolve_remote_envelope_with_probe(
+    account: &crate::workspace::AccountGuard,
+    folder_id: Option<i64>,
+    message_id: i32,
+    media: &Media,
+    caption: &str,
+    probe: impl std::future::Future<Output = Result<Vec<u8>, String>>,
+) -> Result<Option<EncryptedFileRecord>, String> {
     use crate::workspace::envelope_cache;
     account.validate()?;
     let Media::Document(document) = media else {
@@ -324,12 +420,7 @@ pub(crate) async fn resolve_remote_envelope(
         document: document.id(),
         ciphertext_size: media_size(media),
     };
-    let header = envelope_cache::resolve(
-        account,
-        &identity,
-        probe_tdenc2_header(account, client, media),
-    )
-    .await?;
+    let header = envelope_cache::resolve(account, &identity, probe).await?;
     registry_record_from_header(
         folder_id,
         message_id,
@@ -339,6 +430,46 @@ pub(crate) async fn resolve_remote_envelope(
         "owner_document_bound",
     )
     .map(Some)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const LISTING_HEADER_DEFERRED: &str =
+    "Encrypted metadata is temporarily unavailable; open the file or refresh to retry";
+
+/// A first scan after upgrading must not wait forever for an encrypted file's
+/// media datacenter. Limit both one probe and the total network wait per scan.
+/// The owned cache is checked before this future is polled, so cached headers
+/// remain usable even after the network budget has been spent.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct ListingHeaderBudget {
+    remaining: std::time::Duration,
+    per_file: std::time::Duration,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl Default for ListingHeaderBudget {
+    fn default() -> Self {
+        Self {
+            remaining: std::time::Duration::from_secs(15),
+            per_file: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl ListingHeaderBudget {
+    async fn probe(
+        &mut self,
+        fetch: impl std::future::Future<Output = Result<Vec<u8>, String>>,
+    ) -> Result<Vec<u8>, String> {
+        if self.remaining.is_zero() {
+            return Err(LISTING_HEADER_DEFERRED.into());
+        }
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(self.per_file.min(self.remaining), fetch).await;
+        self.remaining = self.remaining.saturating_sub(started.elapsed());
+        result.map_err(|_| LISTING_HEADER_DEFERRED.to_string())?
+    }
 }
 
 fn inferred_mime_type(path: &str) -> &'static str {
@@ -1031,37 +1162,72 @@ pub async fn create_folder_inner(
     })
 }
 
+/// Development-only stand-in for folder operations while no Telegram client is
+/// connected. Release builds and the native E2E driver must report the real
+/// disconnected state instead of fabricating a successful Telegram change.
+#[cfg(all(debug_assertions, not(feature = "native-e2e")))]
+fn disconnected_folder_stand_in(
+    action: &str,
+    folder: FolderMetadata,
+) -> Result<FolderMetadata, String> {
+    log::info!(
+        "[MOCK] {} folder '{}' with ID {}",
+        action,
+        folder.name,
+        folder.id
+    );
+    Ok(folder)
+}
+
+#[cfg(not(all(debug_assertions, not(feature = "native-e2e"))))]
+fn disconnected_folder_stand_in(
+    _action: &str,
+    _folder: FolderMetadata,
+) -> Result<FolderMetadata, String> {
+    Err("Client not connected".to_string())
+}
+
 #[tauri::command]
 pub async fn cmd_create_folder(
     name: String,
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<FolderMetadata, String> {
+    create_folder(name, state.inner(), db_pool.inner().clone()).await
+}
+
+pub(crate) async fn create_folder(
+    name: String,
+    state: &TelegramState,
+    db_pool: DbConnection,
+) -> Result<FolderMetadata, String> {
     let client_opt = { state.client.lock().await.clone() };
 
-    let mut folder = if client_opt.is_none() {
-        let mock_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        log::info!("[MOCK] Created folder '{}' with ID {}", name, mock_id);
-        FolderMetadata {
-            id: mock_id,
-            name,
-            parent_id: None,
-            username: None,
-            is_public: false,
-            group_id: None,
-            display_order: 0,
+    let mut folder = match client_opt {
+        Some(client) => create_folder_inner(&name, &client, &state.peer_cache).await?,
+        None => {
+            let stand_in_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            disconnected_folder_stand_in(
+                "Created",
+                FolderMetadata {
+                    id: stand_in_id,
+                    name,
+                    parent_id: None,
+                    username: None,
+                    is_public: false,
+                    group_id: None,
+                    display_order: 0,
+                },
+            )?
         }
-    } else {
-        let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
-        create_folder_inner(&name, &client, &state.peer_cache).await?
     };
 
     // Save to SQLite
     let folder_for_db = folder.clone();
-    let display_order = crate::db::with_connection(db_pool.inner().clone(), move |conn| {
+    let display_order = crate::db::with_connection(db_pool, move |conn| {
     // Calculate new display order
     let mut max_stmt = conn.prepare("SELECT MAX(display_order) FROM folder_metadata").map_err(|e: sqlite::Error| e.to_string())?;
     let mut display_order = 0;
@@ -1121,17 +1287,39 @@ pub async fn cmd_delete_folder(
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<bool, String> {
+    delete_folder(folder_id, state.inner(), db_pool.inner().clone()).await
+}
+
+fn folder_stand_in(folder_id: i64, name: String) -> FolderMetadata {
+    FolderMetadata {
+        id: folder_id,
+        name,
+        parent_id: None,
+        username: None,
+        is_public: false,
+        group_id: None,
+        display_order: 0,
+    }
+}
+
+pub(crate) async fn delete_folder(
+    folder_id: i64,
+    state: &TelegramState,
+    db_pool: DbConnection,
+) -> Result<bool, String> {
     let client_opt = { state.client.lock().await.clone() };
 
-    if client_opt.is_none() {
-        log::info!("[MOCK] Deleted folder ID {}", folder_id);
-    } else {
-        let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
-        delete_folder_inner(folder_id, &client, &state.peer_cache).await?;
+    match client_opt {
+        Some(client) => {
+            delete_folder_inner(folder_id, &client, &state.peer_cache).await?;
+        }
+        None => {
+            disconnected_folder_stand_in("Deleted", folder_stand_in(folder_id, String::new()))?;
+        }
     }
 
     // Delete from SQLite
-    crate::db::with_connection(db_pool.inner().clone(), move |conn| {
+    crate::db::with_connection(db_pool, move |conn| {
         let mut stmt = conn
             .prepare("DELETE FROM folder_metadata WHERE channel_id = ?")
             .map_err(|e: sqlite::Error| e.to_string())?;
@@ -1184,18 +1372,29 @@ pub async fn cmd_rename_folder(
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<bool, String> {
+    rename_folder(folder_id, new_name, state.inner(), db_pool.inner().clone()).await
+}
+
+pub(crate) async fn rename_folder(
+    folder_id: i64,
+    new_name: String,
+    state: &TelegramState,
+    db_pool: DbConnection,
+) -> Result<bool, String> {
     let client_opt = { state.client.lock().await.clone() };
 
-    if client_opt.is_none() {
-        log::info!("[MOCK] Renamed folder ID {} to {}", folder_id, new_name);
-    } else {
-        let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
-        rename_folder_inner(folder_id, &new_name, &client, &state.peer_cache).await?;
+    match client_opt {
+        Some(client) => {
+            rename_folder_inner(folder_id, &new_name, &client, &state.peer_cache).await?;
+        }
+        None => {
+            disconnected_folder_stand_in("Renamed", folder_stand_in(folder_id, new_name.clone()))?;
+        }
     }
 
     // Update SQLite
     let new_name_for_db = new_name.clone();
-    crate::db::with_connection(db_pool.inner().clone(), move |conn| {
+    crate::db::with_connection(db_pool, move |conn| {
         let mut stmt = conn
             .prepare("UPDATE folder_metadata SET name = ? WHERE channel_id = ?")
             .map_err(|e: sqlite::Error| e.to_string())?;
@@ -1242,6 +1441,221 @@ impl ProgressReader {
             bytes_read: counter.clone(),
         };
         Ok((reader, size, counter))
+    }
+}
+
+impl ProgressReader {
+    /// Open `path` counting into `counter`, which survives a restart of the
+    /// same upload so progress is reported continuously.
+    async fn with_counter(
+        path: &str,
+        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<(Self, u64), String> {
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| e.to_string())?;
+        let size = file.metadata().await.map_err(|e| e.to_string())?.len();
+        Ok((
+            Self {
+                inner: tokio::io::BufReader::new(file),
+                bytes_read: counter,
+            },
+            size,
+        ))
+    }
+}
+
+/// Stops a background task when the operation that started it ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Report an upload's progress from the bytes its reader has consumed.
+fn spawn_upload_progress(
+    app: &tauri::AppHandle,
+    cancelled: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    transfer_id: &str,
+    total_bytes: u64,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Option<AbortOnDrop> {
+    if transfer_id.is_empty() {
+        return None;
+    }
+    let app = app.clone();
+    let transfer_id = transfer_id.to_string();
+    Some(AbortOnDrop(tokio::spawn(async move {
+        let mut last_bytes = 0u64;
+        let mut last_time = std::time::Instant::now();
+        let mut idle_reported = false;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let current = counter.load(std::sync::atomic::Ordering::Relaxed);
+            let now = std::time::Instant::now();
+            // While nothing moves (waiting on Telegram, or finished reading)
+            // one report of zero speed is enough.
+            if current != last_bytes || !idle_reported {
+                let elapsed = now.duration_since(last_time).as_secs_f64();
+                let speed = if elapsed > 0.0 {
+                    (current.saturating_sub(last_bytes) as f64 / elapsed) as u64
+                } else {
+                    0
+                };
+                let percent = if total_bytes == 0 {
+                    0
+                } else {
+                    ((current as f64 / total_bytes as f64) * 100.0).min(99.0) as u8
+                };
+                let _ = app.emit(
+                    "upload-progress",
+                    ProgressPayload {
+                        id: transfer_id.clone(),
+                        percent,
+                        uploaded_bytes: current.min(total_bytes),
+                        total_bytes,
+                        speed_bytes_per_sec: speed,
+                    },
+                );
+                idle_reported = current == last_bytes;
+            }
+            last_bytes = current;
+            last_time = now;
+            if cancelled.read().await.contains(&transfer_id) {
+                break;
+            }
+        }
+    })))
+}
+
+/// Lets `cmd_cancel_transfer` stop an upload for as long as it is running.
+struct UploadCancellation {
+    transfer_id: String,
+    /// Keeps the channel open for an upload nobody can address.
+    _unaddressed: Option<oneshot::Sender<()>>,
+}
+
+impl UploadCancellation {
+    fn register(transfer_id: &str) -> (Self, oneshot::Receiver<()>) {
+        let (sender, receiver) = oneshot::channel();
+        let unaddressed = if transfer_id.is_empty() {
+            Some(sender)
+        } else {
+            get_upload_cancellations()
+                .lock()
+                .unwrap()
+                .insert(transfer_id.to_string(), sender);
+            None
+        };
+        (
+            Self {
+                transfer_id: transfer_id.to_string(),
+                _unaddressed: unaddressed,
+            },
+            receiver,
+        )
+    }
+}
+
+impl Drop for UploadCancellation {
+    fn drop(&mut self) {
+        if !self.transfer_id.is_empty() {
+            get_upload_cancellations()
+                .lock()
+                .unwrap()
+                .remove(&self.transfer_id);
+        }
+    }
+}
+
+/// How one attempt to send a file's bytes ended.
+enum SentParts {
+    Done {
+        file: grammers_client::types::media::Uploaded,
+        /// Some of the parts were sent by an earlier attempt.
+        resumed: bool,
+    },
+    /// Recorded progress was unusable and has been discarded; start over.
+    Restart,
+    Cancelled,
+}
+
+async fn pace_download(
+    network: &NetworkConfig,
+    account: &crate::workspace::AccountGuard,
+    state: &TelegramState,
+    transfer_id: &str,
+    bytes: usize,
+) -> Result<(), String> {
+    tokio::select! {
+        result=network.pacer.wait(network,crate::traffic::Direction::Download,bytes,||account.validate())=>result,
+        _=async {loop {if state.cancelled_transfers.read().await.contains(transfer_id){break;}tokio::time::sleep(std::time::Duration::from_millis(100)).await;}}=>Err("Transfer cancelled".into()),
+    }
+}
+
+/// Send `reader`, positioned at the first byte, to Telegram. A resumable
+/// upload skips the parts an earlier attempt delivered.
+#[allow(clippy::too_many_arguments)] // Carries the upload source, cancellation and account-bound traffic policy.
+async fn send_upload_stream<R: tokio::io::AsyncRead + Unpin + Send>(
+    client: &grammers_client::Client,
+    resumable: Option<&ResumableUpload>,
+    reader: &mut R,
+    total_bytes: u64,
+    remote_name: String,
+    envelope_header: Option<&[u8]>,
+    cancel: &mut oneshot::Receiver<()>,
+    traffic: crate::traffic::Traffic,
+) -> Result<SentParts, String> {
+    let upload = async {
+        match resumable {
+            Some(resumable) => {
+                let sink = crate::resumable_upload::PacedSink {
+                    sink: TelegramSink(client.clone()),
+                    traffic: traffic.clone(),
+                };
+                match resumable
+                    .upload(&sink, reader, total_bytes, &remote_name, envelope_header)
+                    .await
+                {
+                    Ok(parts) => {
+                        let resumed = parts.resumed_parts > 0;
+                        if resumed {
+                            log::info!(
+                                "Upload continued after {} of {} parts",
+                                parts.resumed_parts,
+                                parts.total_parts
+                            );
+                        }
+                        Ok(SentParts::Done {
+                            file: parts.into_uploaded(),
+                            resumed,
+                        })
+                    }
+                    Err(UploadError::Stale(reason)) => {
+                        log::info!("Upload starts over: {reason}");
+                        Ok(SentParts::Restart)
+                    }
+                    Err(UploadError::Failed(error)) => Err(error),
+                }
+            }
+            None => {
+                let mut reader = crate::traffic::Reader::new(reader, traffic.clone());
+                client
+                    .upload_stream(&mut reader, total_bytes as usize, remote_name)
+                    .await
+                    .map(|file| SentParts::Done {
+                        file,
+                        resumed: false,
+                    })
+                    .map_err(map_error)
+            }
+        }
+    };
+    tokio::select! {
+        result = upload => result,
+        _ = cancel => Ok(SentParts::Cancelled),
     }
 }
 
@@ -1364,11 +1778,316 @@ fn publish_verified_android_download(
     }
 }
 
+/// Open one key slot with the credential of its kind, if that was supplied.
+fn unwrap_slot_dek(
+    header: &EnvelopeHeader,
+    slot: &KeySlotEntry,
+    vault_key: Option<&SecretKey>,
+    prompt_passphrase: Option<&SecretBytes>,
+) -> Option<SecretKey> {
+    use crate::crypto::envelope::key_slot::unwrap_dek;
+    let wrapping_key = if slot.kind == policy::SlotKind::Vault as u8 {
+        kdf::derive_file_wrapping_key(
+            vault_key?,
+            &header.core.file_uuid,
+            &slot.salt,
+            slot.kind,
+            slot.slot_id,
+        )
+    } else if slot.kind == policy::SlotKind::Passphrase as u8 {
+        kdf::derive_passphrase_key(
+            prompt_passphrase?.expose(),
+            &slot.salt,
+            slot.argon2_memory_kib,
+            slot.argon2_iterations,
+            slot.argon2_parallelism,
+        )
+    } else {
+        return None;
+    }
+    .ok()?;
+    unwrap_dek(
+        &KeySlotContext {
+            file_uuid: &header.core.file_uuid,
+            format_version: header.core.format_version,
+        },
+        &slot.wrapped_dek,
+        &slot.wrap_nonce,
+        &wrapping_key,
+        slot.kind,
+        slot.slot_id,
+        slot.kdf_algorithm,
+        slot.argon2_memory_kib,
+        slot.argon2_iterations,
+        slot.argon2_parallelism,
+        &slot.salt,
+    )
+    .ok()
+}
+
+/// Continue the envelope an interrupted upload began, but only if it is the
+/// envelope this upload would create: the same size, protection and protected
+/// metadata, with every key slot opened by the credentials supplied now.
+/// Otherwise the upload gets a new envelope with new keys.
+fn resumed_envelope_session(
+    header_bytes: &[u8],
+    plaintext_size: u64,
+    protection_mode: UploadProtectionMode,
+    vault_key: Option<&SecretKey>,
+    prompt_passphrase: Option<&SecretBytes>,
+    metadata_plaintext: &[u8],
+) -> Option<EncryptionSession> {
+    let header = EnvelopeHeader::parse(header_bytes).ok()?;
+    if header.core.total_plaintext_length != plaintext_size
+        || header.core.chunk_size != policy::DEFAULT_CHUNK_SIZE
+        || protection_mode_from_header(&header).ok()? != protection_mode.registry_name()
+    {
+        return None;
+    }
+    let mut dek: Option<SecretKey> = None;
+    for slot in &header.key_slots {
+        let unwrapped = unwrap_slot_dek(&header, slot, vault_key, prompt_passphrase)?;
+        if dek
+            .as_ref()
+            .is_some_and(|dek| dek.expose() != unwrapped.expose())
+        {
+            return None;
+        }
+        dek = Some(unwrapped);
+    }
+    let dek = dek?;
+    if header.verify_and_decrypt_metadata(&dek).ok()? != metadata_plaintext {
+        return None;
+    }
+    EncryptionSession::from_header(header_bytes.to_vec(), dek).ok()
+}
+
+/// A new envelope: fresh keys, wrapped for the vault and/or a file passphrase.
+fn new_envelope_session(
+    plaintext_size: u64,
+    protection_mode: UploadProtectionMode,
+    vault_key: Option<&SecretKey>,
+    prompt_passphrase: Option<&SecretBytes>,
+    metadata_plaintext: Vec<u8>,
+) -> Result<EncryptionSession, String> {
+    let dek = SecretKey::new(random::random_key());
+    let file_uuid = random::random_uuid();
+    let nonce_prefix = random::random_nonce_prefix();
+    let ctx = KeySlotContext {
+        file_uuid: &file_uuid,
+        format_version: policy::FORMAT_VERSION,
+    };
+    let mut key_slots = Vec::with_capacity(
+        if protection_mode == UploadProtectionMode::VaultAndPassphrase {
+            2
+        } else {
+            1
+        },
+    );
+
+    if let Some(wrapping_key) = vault_key {
+        key_slots.push(vault_encryption_slot(wrapping_key, &file_uuid, &dek)?);
+    }
+
+    if let Some(passphrase) = prompt_passphrase {
+        let salt = random::random_salt();
+        let slot_kind = policy::SlotKind::Passphrase as u8;
+        let slot_id = if key_slots.is_empty() { 0 } else { 1 };
+        let memory_kib = policy::ARGON2_MEMORY_FLOOR_KIB;
+        let iterations = policy::ARGON2_ITERATIONS_FLOOR;
+        let parallelism = policy::ARGON2_PARALLELISM_FLOOR;
+        let file_wrapping_key = kdf::derive_passphrase_key(
+            passphrase.expose(),
+            &salt,
+            memory_kib,
+            iterations,
+            parallelism,
+        )
+        .map_err(|e| format!("Failed to derive passphrase key: {}", e))?;
+        let (wrapped_dek, wrap_nonce) = wrap_dek(
+            &ctx,
+            &dek,
+            &file_wrapping_key,
+            slot_kind,
+            slot_id,
+            policy::KdfAlgorithm::Argon2id as u16,
+            memory_kib,
+            iterations,
+            parallelism,
+            &salt,
+        )
+        .map_err(|e| format!("Failed to wrap DEK: {}", e))?;
+        key_slots.push(KeySlotEntry {
+            kind: slot_kind,
+            slot_id,
+            kdf_algorithm: policy::KdfAlgorithm::Argon2id as u16,
+            argon2_memory_kib: memory_kib,
+            argon2_iterations: iterations,
+            argon2_parallelism: parallelism,
+            salt,
+            wrap_nonce,
+            wrapped_dek,
+        });
+    }
+
+    EncryptionSession::new_with_keys(
+        plaintext_size,
+        key_slots,
+        metadata_plaintext,
+        dek,
+        file_uuid,
+        nonce_prefix,
+    )
+    .map_err(|e| format!("Failed to create encryption session: {}", e))
+}
+
+/// The readable stream of one protected upload, with what identifies it.
+pub(crate) struct ProtectedUploadStream<R: tokio::io::AsyncRead + Unpin> {
+    pub reader: EncryptingReader<R>,
+    pub header: Vec<u8>,
+    pub file_uuid: [u8; 16],
+    pub remote_name: String,
+    pub ciphertext_size: u64,
+    /// The envelope continues one that an interrupted upload began.
+    pub continued: bool,
+}
+
+/// Encode what a protected file keeps inside its envelope about itself.
+pub(crate) fn protected_metadata_bytes(
+    path: &str,
+    protect_metadata: bool,
+    sync_path: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    if !protect_metadata {
+        return Ok(Vec::new());
+    }
+    let original_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Encrypted file");
+    serde_json::to_vec(&ProtectedFileMetadata {
+        schema_version: 1,
+        original_name,
+        mime_type: inferred_mime_type(path),
+        sync_path,
+    })
+    .map_err(|e| format!("Failed to encode protected metadata: {}", e))
+}
+
+fn prepare_protected_envelope(
+    plaintext_size: u64,
+    protection_mode_name: &str,
+    vault_key: Option<&SecretKey>,
+    prompt_passphrase: Option<&SecretBytes>,
+    metadata_plaintext: Vec<u8>,
+    recorded_header: Option<&[u8]>,
+) -> Result<(EncryptionSession, bool), String> {
+    let protection_mode = UploadProtectionMode::parse(Some(protection_mode_name))?;
+    let continued_session = recorded_header.and_then(|header| {
+        resumed_envelope_session(
+            header,
+            plaintext_size,
+            protection_mode,
+            vault_key,
+            prompt_passphrase,
+            &metadata_plaintext,
+        )
+    });
+    let continued = continued_session.is_some();
+    let session = match continued_session {
+        Some(session) => session,
+        None => new_envelope_session(
+            plaintext_size,
+            protection_mode,
+            vault_key,
+            prompt_passphrase,
+            metadata_plaintext,
+        )?,
+    };
+    Ok((session, continued))
+}
+
+fn attach_protected_envelope<R: tokio::io::AsyncRead + Unpin>(
+    plaintext: R,
+    session: EncryptionSession,
+    continued: bool,
+) -> ProtectedUploadStream<R> {
+    let file_uuid = session.file_uuid;
+    let header = session.header_bytes.clone();
+    let ciphertext_size = session.total_ciphertext_length;
+    let b32_name = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(file_uuid);
+    let remote_name = format!("tdrive_{}.tdenc", &b32_name[..b32_name.len().min(32)]);
+    ProtectedUploadStream {
+        reader: EncryptingReader::new(plaintext, session),
+        header,
+        file_uuid,
+        remote_name,
+        ciphertext_size,
+        continued,
+    }
+}
+
+/// Prepare fresh/resumed passphrase slots on the bounded blocking pool, then
+/// attach the application's async reader without moving file I/O to that pool.
+#[allow(clippy::too_many_arguments)] // Same independent inputs as the synchronous compatibility wrapper.
+pub(crate) async fn protected_upload_stream_off_worker<R: tokio::io::AsyncRead + Unpin>(
+    plaintext: R,
+    plaintext_size: u64,
+    protection_mode_name: &str,
+    vault_key: Option<&SecretKey>,
+    prompt_passphrase: Option<&SecretBytes>,
+    metadata_plaintext: Vec<u8>,
+    recorded_header: Option<&[u8]>,
+) -> Result<ProtectedUploadStream<R>, String> {
+    let mode = protection_mode_name.to_string();
+    let vault_key = vault_key.cloned();
+    let passphrase = prompt_passphrase.cloned();
+    let header = recorded_header.map(<[u8]>::to_vec);
+    let (session, continued) = kdf::blocking(move || {
+        prepare_protected_envelope(
+            plaintext_size,
+            &mode,
+            vault_key.as_ref(),
+            passphrase.as_ref(),
+            metadata_plaintext,
+            header.as_deref(),
+        )
+    })
+    .await??;
+    Ok(attach_protected_envelope(plaintext, session, continued))
+}
+
 pub(crate) fn initialize_tdenc2_decryptor(
     header_bytes: &[u8],
     vault_key: Option<&SecretKey>,
     prompt_passphrase: Option<&SecretBytes>,
 ) -> Result<crate::crypto::envelope::decrypt_reader::DecryptReader, String> {
+    initialize_tdenc2_decryptor_with_kind(header_bytes, vault_key, prompt_passphrase)
+        .map(|(reader, _)| reader)
+}
+
+pub(crate) async fn initialize_tdenc2_decryptor_off_worker(
+    header_bytes: &[u8],
+    vault_key: Option<&SecretKey>,
+    prompt_passphrase: Option<&SecretBytes>,
+) -> Result<(crate::crypto::envelope::decrypt_reader::DecryptReader, bool), String> {
+    if prompt_passphrase.is_none() {
+        return initialize_tdenc2_decryptor_with_kind(header_bytes, vault_key, None);
+    }
+    let header = header_bytes.to_vec();
+    let vault_key = vault_key.cloned();
+    let passphrase = prompt_passphrase.cloned();
+    kdf::blocking(move || {
+        initialize_tdenc2_decryptor_with_kind(&header, vault_key.as_ref(), passphrase.as_ref())
+    })
+    .await?
+}
+
+fn initialize_tdenc2_decryptor_with_kind(
+    header_bytes: &[u8],
+    vault_key: Option<&SecretKey>,
+    prompt_passphrase: Option<&SecretBytes>,
+) -> Result<(crate::crypto::envelope::decrypt_reader::DecryptReader, bool), String> {
     use crate::crypto::envelope::decrypt_reader::DecryptReader;
     use crate::crypto::envelope::header::EnvelopeHeader;
     use crate::crypto::envelope::key_slot::unwrap_dek;
@@ -1424,12 +2143,14 @@ pub(crate) fn initialize_tdenc2_decryptor(
         ) else {
             continue;
         };
-        return DecryptReader::new(header_bytes, dek).map_err(|error| {
-            format!(
-                "[WRONG_KEY_OR_CORRUPT] Failed to authenticate encrypted header: {}",
-                error
-            )
-        });
+        return DecryptReader::new(header_bytes, dek)
+            .map(|reader| (reader, slot.kind == policy::SlotKind::Vault as u8))
+            .map_err(|error| {
+                format!(
+                    "[WRONG_KEY_OR_CORRUPT] Failed to authenticate encrypted header: {}",
+                    error
+                )
+            });
     }
 
     if header
@@ -1546,40 +2267,28 @@ pub async fn cmd_validate_dropped_paths(paths: Vec<String>) -> DroppedPathValida
     validate_dropped_paths(paths).await
 }
 
-#[cfg(test)]
-mod dropped_path_tests {
-    use super::validate_dropped_paths;
+/// Telegram's regular-account media caption limit is 1024 characters.
+/// Keep Unicode scalars intact and count UTF-16 units conservatively, without
+/// applying Markdown/HTML parsing to literal filenames. Encrypted uploads never
+/// use this caption path: their metadata stays inside the encrypted envelope.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn video_filename_caption_text(filename: &str, enabled: Option<bool>) -> String {
+    crate::desktop_video_upload::caption(filename, enabled)
+}
 
-    #[tokio::test]
-    async fn accepts_files_and_rejects_directories_missing_paths_and_duplicates() {
-        let root = std::env::temp_dir().join(format!(
-            "telegram-drive-drop-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&root).expect("test directory should be created");
-        let file = root.join("upload.txt");
-        std::fs::write(&file, b"upload").expect("test file should be created");
-        let missing = root.join("missing.txt");
-
-        let result = validate_dropped_paths(vec![
-            file.to_string_lossy().into_owned(),
-            file.to_string_lossy().into_owned(),
-            root.to_string_lossy().into_owned(),
-            missing.to_string_lossy().into_owned(),
-        ])
-        .await;
-
-        assert_eq!(result.accepted, vec![file.to_string_lossy().into_owned()]);
-        assert_eq!(result.rejected.len(), 2);
-        assert_eq!(result.rejected[0].reason, "directory");
-        assert_eq!(result.rejected[1].reason, "missing");
-
-        std::fs::remove_dir_all(&root).expect("test directory should be removed");
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn video_filename_caption_text(filename: &str, enabled: Option<bool>) -> String {
+    if !enabled.unwrap_or(true) {
+        return String::new();
     }
+    let mut units = 0;
+    filename
+        .chars()
+        .take_while(|character| {
+            units += character.len_utf16();
+            units <= 1024
+        })
+        .collect()
 }
 
 #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
@@ -1593,6 +2302,49 @@ pub async fn cmd_upload_file(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
+    app_handle: tauri::AppHandle,
+    state: State<'_, TelegramState>,
+    bw_state: State<'_, Arc<BandwidthManager>>,
+    net_config: State<'_, std::sync::Arc<NetworkConfig>>,
+    crypto_state: State<'_, crate::crypto::state::CryptoState>,
+    db_pool: State<'_, DbConnection>,
+    owner_id: Option<String>,
+) -> Result<String, String> {
+    upload_local_file(
+        path,
+        folder_id,
+        transfer_id,
+        protection_mode,
+        prompt_token,
+        protect_metadata,
+        video_upload_mode,
+        video_filename_caption,
+        None,
+        app_handle,
+        state,
+        bw_state,
+        net_config,
+        crypto_state,
+        db_pool,
+        owner_id,
+    )
+    .await
+}
+
+/// Upload a local file. `sync_path` is set by Folder Sync: the file's path
+/// inside its mapped folder, kept in a protected file's encrypted metadata.
+#[allow(clippy::too_many_arguments)] // The upload command's inputs plus the sync path.
+pub(crate) async fn upload_local_file(
+    path: String,
+    folder_id: Option<i64>,
+    transfer_id: Option<String>,
+    protection_mode: Option<String>,
+    prompt_token: Option<u64>,
+    protect_metadata: Option<bool>,
+    video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
+    sync_path: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
@@ -1617,6 +2369,8 @@ pub async fn cmd_upload_file(
             prompt_token,
             protect_metadata,
             video_upload_mode,
+            video_filename_caption,
+            sync_path,
             app_handle,
             state,
             bw_state,
@@ -1638,6 +2392,8 @@ async fn cmd_upload_file_owned(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
+    sync_path: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
@@ -1679,6 +2435,9 @@ async fn cmd_upload_file_owned(
         prompt_token,
         protect_metadata,
         video_upload_mode,
+        video_filename_caption,
+        sync_path,
+        None,
         app_handle,
         state,
         bw_state,
@@ -1705,6 +2464,9 @@ async fn cmd_upload_file_inner(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
+    sync_path: Option<String>,
+    admitted_upload: Option<BandwidthReservation>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
@@ -1750,6 +2512,8 @@ async fn cmd_upload_file_inner(
             protection_mode,
             prompt_token,
             protect_metadata.unwrap_or(true),
+            sync_path,
+            admitted_upload,
         )
         .await;
     }
@@ -1762,11 +2526,36 @@ async fn cmd_upload_file_inner(
         .unwrap_or_else(|| "file".to_string());
     // Inspect metadata before reserving transfer quota so a malformed video
     // cannot strand a bandwidth reservation.
+    let tid = transfer_id.unwrap_or_default();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let (_cancellation, mut cancel_rx) = UploadCancellation::register(&tid);
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if state.cancelled_transfers.read().await.contains(&tid) {
+        state.cancelled_transfers.write().await.remove(&tid);
+        return Err("Transfer cancelled".into());
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let video_metadata = prepare_video_upload_metadata(
+        &path,
+        &file_name,
+        video_upload_mode,
+        &transfer_account,
+        &mut cancel_rx,
+        app_handle.path().resource_dir().ok(),
+        bw_state.inner().clone(),
+    )
+    .await?;
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     let video_metadata =
         prepare_video_upload_metadata(&path, &file_name, video_upload_mode).await?;
-    let mut upload_reservation = BandwidthReservation::upload(bw_state.inner().clone(), size)?;
-
-    let tid = transfer_id.unwrap_or_default();
+    let video_caption = video_filename_caption_text(&file_name, video_filename_caption);
+    let mut upload_reservation = match admitted_upload {
+        Some(mut hold) => {
+            hold.resize(size)?;
+            hold
+        }
+        None => BandwidthReservation::upload(bw_state.inner().clone(), size)?,
+    };
 
     let client_opt = { state.client.lock().await.clone() };
     #[cfg(debug_assertions)]
@@ -1791,123 +2580,34 @@ async fn cmd_upload_file_inner(
         );
     }
 
-    // Create progress-tracking reader
-    let (mut reader, file_size, bytes_counter) = ProgressReader::new(&path).await?;
-    // Spawn a progress reporter task that emits events every 250ms
-    let cancelled = state.cancelled_transfers.clone();
-    let progress_tid = tid.clone();
-    let progress_handle = app_handle.clone();
-    let progress_counter = bytes_counter.clone();
-    let progress_task = if !tid.is_empty() {
-        Some(tokio::spawn(async move {
-            let mut last_bytes: u64 = 0;
-            let mut last_time = std::time::Instant::now();
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                let current = progress_counter.load(std::sync::atomic::Ordering::Relaxed);
-                let now = std::time::Instant::now();
-                let dt = now.duration_since(last_time).as_secs_f64();
-                let speed = if dt > 0.0 {
-                    ((current - last_bytes) as f64 / dt) as u64
-                } else {
-                    0
-                };
-                let percent = if file_size > 0 {
-                    ((current as f64 / file_size as f64) * 100.0).min(99.0) as u8
-                } else {
-                    0
-                };
-
-                let _ = progress_handle.emit(
-                    "upload-progress",
-                    ProgressPayload {
-                        id: progress_tid.clone(),
-                        percent,
-                        uploaded_bytes: current,
-                        total_bytes: file_size,
-                        speed_bytes_per_sec: speed,
-                    },
-                );
-
-                last_bytes = current;
-                last_time = now;
-
-                if current >= file_size {
-                    break;
-                }
-                if cancelled.read().await.contains(&progress_tid) {
-                    break;
-                }
-            }
-        }))
+    // A large upload continues an earlier attempt for the same unchanged file.
+    let source_path = std::path::Path::new(&path);
+    let resumable = if size > RESUMABLE_FROM_BYTES {
+        Some(ResumableUpload::new(
+            &transfer_account,
+            session_key(folder_id, source_path, "plain"),
+            SourceFingerprint::of(source_path).await?,
+        ))
     } else {
         None
     };
 
+    let bytes_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let _progress = spawn_upload_progress(
+        &app_handle,
+        state.cancelled_transfers.clone(),
+        &tid,
+        size,
+        bytes_counter.clone(),
+    );
+
     // Check cancellation before starting
     if state.cancelled_transfers.read().await.contains(&tid) {
         state.cancelled_transfers.write().await.remove(&tid);
-        if let Some(t) = progress_task {
-            t.abort();
-        }
         return Err("Transfer cancelled".to_string());
     }
-
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    if !tid.is_empty() {
-        get_upload_cancellations()
-            .lock()
-            .unwrap()
-            .insert(tid.clone(), cancel_tx);
-    }
-
-    let client_clone = client.clone();
-    let mut upload_task = tokio::spawn(async move {
-        client_clone
-            .upload_stream(&mut reader, file_size as usize, file_name)
-            .await
-    });
-
-    let upload_result = {
-        tokio::select! {
-            res = &mut upload_task => {
-                if !tid.is_empty() {
-                    get_upload_cancellations().lock().unwrap().remove(&tid);
-                }
-                res.map_err(|e| {
-                    if let Some(task) = &progress_task { task.abort(); }
-                    format!("Task join error: {}", e)
-                })?
-            }
-            _ = cancel_rx => {
-                log::info!("Aborting upload task for transfer ID: {}", tid);
-                upload_task.abort();
-                state.cancelled_transfers.write().await.remove(&tid);
-                if let Some(t) = progress_task { t.abort(); }
-                        return Err("Transfer cancelled".to_string());
-            }
-        }
-    };
-
-    if let Some(t) = progress_task {
-        t.abort();
-    }
-
-    let uploaded_file = upload_result.map_err(map_error)?;
-    let message = match video_metadata {
-        Some(video) => InputMessage::new()
-            .text("")
-            .mime_type(video.mime_type)
-            .document(uploaded_file)
-            .attribute(Attribute::Video {
-                round_message: false,
-                supports_streaming: true,
-                duration: video.duration,
-                w: video.width,
-                h: video.height,
-            }),
-        None => InputMessage::new().text("").file(uploaded_file),
-    };
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let (_cancellation, mut cancel_rx) = UploadCancellation::register(&tid);
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
@@ -1915,62 +2615,221 @@ async fn cmd_upload_file_inner(
     let base_ms = net_config.retry_base_backoff_ms();
     let max_ms = net_config.retry_max_backoff_ms();
     let respect_flood = net_config.should_respect_flood_wait();
-    let mut last_err = String::new();
+    let mut restarted = false;
 
-    for attempt in 0..=max_retries {
-        transfer_account.validate()?;
-        match client.send_message(&peer, message.clone()).await {
-            Ok(sent) => {
-                upload_reservation.commit();
-                if !tid.is_empty() {
-                    let _ = app_handle.emit(
-                        "upload-progress",
-                        ProgressPayload {
-                            id: tid,
-                            percent: 100,
-                            uploaded_bytes: size,
-                            total_bytes: size,
-                            speed_bytes_per_sec: 0,
-                        },
-                    );
-                }
-                return Ok(sent.id().to_string());
+    loop {
+        bytes_counter.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (mut reader, file_size) =
+            ProgressReader::with_counter(&path, bytes_counter.clone()).await?;
+        if file_size != size {
+            return Err("Source file size changed before the upload started".to_string());
+        }
+        let (uploaded_file, resumed) = match send_upload_stream(
+            &client,
+            resumable.as_ref(),
+            &mut reader,
+            size,
+            file_name.clone(),
+            None,
+            &mut cancel_rx,
+            crate::traffic::Traffic {
+                network: net_config.inner().clone(),
+                account: transfer_account.clone(),
+                direction: crate::traffic::Direction::Upload,
+            },
+        )
+        .await?
+        {
+            SentParts::Done { file, resumed } => (file, resumed),
+            SentParts::Restart if !restarted => {
+                restarted = true;
+                continue;
             }
-            Err(e) => {
-                let err = map_error(e);
-                log::warn!(
-                    "send_message attempt {}/{}: {}",
-                    attempt + 1,
-                    max_retries + 1,
-                    err
-                );
-                if respect_flood && err.starts_with("FLOOD_WAIT_") {
-                    if let Ok(secs) = err.trim_start_matches("FLOOD_WAIT_").parse::<u64>() {
-                        let wait = secs.min(300);
-                        log::info!("Respecting FLOOD_WAIT: sleeping {}s", wait);
-                        wait_for_telegram_cooldown(&app_handle, "Upload", wait).await;
-                        last_err = err;
-                        continue;
+            SentParts::Restart => {
+                return Err("The upload could not be restarted cleanly; try again".to_string())
+            }
+            SentParts::Cancelled => {
+                log::info!("Aborting upload task for transfer ID: {}", tid);
+                state.cancelled_transfers.write().await.remove(&tid);
+                return Err("Transfer cancelled".to_string());
+            }
+        };
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let message = InputMessage::new().text("").file(uploaded_file.clone());
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let message = match video_metadata {
+            Some(video) => InputMessage::new()
+                .text(video_caption.clone())
+                .mime_type(video.mime_type)
+                .document(uploaded_file)
+                .attribute(Attribute::Video {
+                    round_message: false,
+                    supports_streaming: true,
+                    duration: video.duration,
+                    w: video.width,
+                    h: video.height,
+                }),
+            None => InputMessage::new().text("").file(uploaded_file),
+        };
+
+        let mut last_err = String::new();
+        for attempt in 0..=max_retries {
+            transfer_account.validate()?;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let publication = if let Some(video) = video_metadata.as_ref() {
+                crate::desktop_video_upload::publish(
+                    video,
+                    uploaded_file.clone(),
+                    video_caption.clone(),
+                    &crate::desktop_video_upload::TelegramTransport {
+                        client: &client,
+                        peer: &peer,
+                    },
+                    &transfer_account,
+                    bw_state.inner().clone(),
+                    net_config.inner().clone(),
+                    &mut cancel_rx,
+                )
+                .await
+            } else {
+                client
+                    .send_message(&peer, message.clone())
+                    .await
+                    .map_err(map_error)
+            };
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let publication = client
+                .send_message(&peer, message.clone())
+                .await
+                .map_err(map_error);
+            match publication {
+                Ok(sent) => {
+                    crate::file_inventory::changed(&transfer_account, folder_id, &[])?;
+                    upload_reservation.commit();
+                    if let Some(resumable) = &resumable {
+                        // Published: there is nothing left to continue.
+                        if let Err(error) = resumable.discard().await {
+                            log::warn!("Could not clear finished upload progress: {error}");
+                        }
                     }
+                    if !tid.is_empty() {
+                        let _ = app_handle.emit(
+                            "upload-progress",
+                            ProgressPayload {
+                                id: tid.clone(),
+                                percent: 100,
+                                uploaded_bytes: size,
+                                total_bytes: size,
+                                speed_bytes_per_sec: 0,
+                            },
+                        );
+                    }
+                    return Ok(sent.id().to_string());
                 }
-                last_err = err;
-                if attempt < max_retries {
-                    let delay = backoff_ms(attempt, base_ms, max_ms);
-                    log::info!("Retrying in {}ms...", delay);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                Err(e) => {
+                    let err = e;
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if err == "Transfer cancelled"
+                        || err.starts_with("ACCOUNT_CHANGED")
+                        || err.starts_with("[VIDEO_SOURCE_CHANGED]")
+                    {
+                        return Err(err);
+                    }
+                    log::warn!(
+                        "send_message attempt {}/{}: {}",
+                        attempt + 1,
+                        max_retries + 1,
+                        err
+                    );
+                    if parts_unusable(&err) {
+                        // Repeating the request cannot bring the parts back.
+                        last_err = err;
+                        break;
+                    }
+                    if respect_flood && err.starts_with("FLOOD_WAIT_") {
+                        if let Ok(secs) = err.trim_start_matches("FLOOD_WAIT_").parse::<u64>() {
+                            let wait = secs.min(300);
+                            log::info!("Respecting FLOOD_WAIT: sleeping {}s", wait);
+                            wait_for_telegram_cooldown(&app_handle, "Upload", wait).await;
+                            last_err = err;
+                            continue;
+                        }
+                    }
+                    last_err = err;
+                    if attempt < max_retries {
+                        let delay = backoff_ms(attempt, base_ms, max_ms);
+                        log::info!("Retrying in {}ms...", delay);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
                 }
             }
         }
-    }
 
-    Err(format!(
-        "Upload failed after {} attempts: {}",
-        max_retries + 1,
-        last_err
-    ))
+        if parts_unusable(&last_err) {
+            if let Some(resumable) = &resumable {
+                resumable.discard().await?;
+            }
+            // Telegram no longer holds what an earlier attempt sent.
+            let can_restart = resumed
+                || (cfg!(not(any(target_os = "android", target_os = "ios")))
+                    && video_metadata.is_some());
+            if can_restart && !restarted {
+                restarted = true;
+                continue;
+            }
+        }
+        return Err(format!(
+            "Upload failed after {} attempts: {}",
+            max_retries + 1,
+            last_err
+        ));
+    }
 }
 
-/// Encrypted upload path: wraps the file with EncryptingReader, uploads TDENC1 bytes.
+/// Build the production vault slot for a TDENC2 upload.
+pub(crate) fn vault_encryption_slot(
+    wrapping_key: &SecretKey,
+    file_uuid: &[u8; 16],
+    dek: &SecretKey,
+) -> Result<KeySlotEntry, String> {
+    let ctx = KeySlotContext {
+        file_uuid,
+        format_version: policy::FORMAT_VERSION,
+    };
+    let salt = random::random_salt();
+    let slot_kind = policy::SlotKind::Vault as u8;
+    let slot_id = 0;
+    let file_wrapping_key =
+        kdf::derive_file_wrapping_key(wrapping_key, file_uuid, &salt, slot_kind, slot_id)
+            .map_err(|e| format!("Failed to derive file wrapping key: {}", e))?;
+    let (wrapped_dek, wrap_nonce) = wrap_dek(
+        &ctx,
+        dek,
+        &file_wrapping_key,
+        slot_kind,
+        slot_id,
+        policy::KdfAlgorithm::HkdfSha256 as u16,
+        0,
+        0,
+        0,
+        &salt,
+    )
+    .map_err(|e| format!("Failed to wrap DEK: {}", e))?;
+    Ok(KeySlotEntry {
+        kind: slot_kind,
+        slot_id,
+        kdf_algorithm: policy::KdfAlgorithm::HkdfSha256 as u16,
+        argon2_memory_kib: 0,
+        argon2_iterations: 0,
+        argon2_parallelism: 0,
+        salt,
+        wrap_nonce,
+        wrapped_dek,
+    })
+}
+
+/// Encrypted upload path: wraps the file with EncryptingReader, uploads TDENC2 bytes.
 #[allow(clippy::too_many_arguments)] // Carries the same state bundle as the upload command.
 async fn cmd_upload_file_encrypted(
     path: String,
@@ -1986,6 +2845,8 @@ async fn cmd_upload_file_encrypted(
     protection_mode: UploadProtectionMode,
     prompt_token: Option<u64>,
     protect_metadata: bool,
+    sync_path: Option<String>,
+    mut admitted_upload: Option<BandwidthReservation>,
 ) -> Result<String, String> {
     let transfer_account = capture_transfer_account(
         &app_handle,
@@ -1994,15 +2855,15 @@ async fn cmd_upload_file_encrypted(
     )
     .await?;
 
-    use crate::crypto::envelope::length::calculate_ciphertext_length;
-
-    let vault_wrapping_key = if protection_mode.needs_vault() {
-        Some(crypto_state.get_current_wrapping_key().map_err(|_| {
+    let vault_credential = if protection_mode.needs_vault() {
+        Some(crypto_state.current_credential().map_err(|_| {
             "[VAULT_LOCKED] Unlock the vault before starting this upload".to_string()
         })?)
     } else {
         None
     };
+    let vault_session = vault_credential.as_ref().map(|(id, _)| *id);
+    let vault_wrapping_key = vault_credential.map(|(_, key)| key);
     let prompt_secret = if protection_mode.needs_passphrase() {
         let token = prompt_token.ok_or_else(|| {
             "[KEY_REQUIRED] Enter a file passphrase before starting this upload".to_string()
@@ -2016,134 +2877,29 @@ async fn cmd_upload_file_encrypted(
         None
     };
 
-    // Generate keys for the encryption session
-    let dek = SecretKey::new(random::random_key());
-    let file_uuid = random::random_uuid();
-    let nonce_prefix = random::random_nonce_prefix();
+    // The protected original name and MIME type, and for Folder Sync the
+    // file's path inside its mapped folder.
+    let metadata_plaintext =
+        protected_metadata_bytes(&path, protect_metadata, sync_path.as_deref())?;
 
-    let ctx = KeySlotContext {
-        file_uuid: &file_uuid,
-        format_version: policy::FORMAT_VERSION,
-    };
-    let mut key_slots = Vec::with_capacity(
-        if protection_mode == UploadProtectionMode::VaultAndPassphrase {
-            2
-        } else {
-            1
-        },
-    );
-
-    if let Some(wrapping_key) = vault_wrapping_key.as_ref() {
-        let salt = random::random_salt();
-        let slot_kind = policy::SlotKind::Vault as u8;
-        let slot_id = 0;
-        let file_wrapping_key =
-            kdf::derive_file_wrapping_key(wrapping_key, &file_uuid, &salt, slot_kind, slot_id)
-                .map_err(|e| format!("Failed to derive file wrapping key: {}", e))?;
-        let (wrapped_dek, wrap_nonce) = wrap_dek(
-            &ctx,
-            &dek,
-            &file_wrapping_key,
-            slot_kind,
-            slot_id,
-            policy::KdfAlgorithm::HkdfSha256 as u16,
-            0,
-            0,
-            0,
-            &salt,
-        )
-        .map_err(|e| format!("Failed to wrap DEK: {}", e))?;
-        key_slots.push(KeySlotEntry {
-            kind: slot_kind,
-            slot_id,
-            kdf_algorithm: policy::KdfAlgorithm::HkdfSha256 as u16,
-            argon2_memory_kib: 0,
-            argon2_iterations: 0,
-            argon2_parallelism: 0,
-            salt,
-            wrap_nonce,
-            wrapped_dek,
-        });
-    }
-
-    if let Some(passphrase) = prompt_secret.as_ref() {
-        let salt = random::random_salt();
-        let slot_kind = policy::SlotKind::Passphrase as u8;
-        let slot_id = if key_slots.is_empty() { 0 } else { 1 };
-        let memory_kib = policy::ARGON2_MEMORY_FLOOR_KIB;
-        let iterations = policy::ARGON2_ITERATIONS_FLOOR;
-        let parallelism = policy::ARGON2_PARALLELISM_FLOOR;
-        let file_wrapping_key = kdf::derive_passphrase_key(
-            passphrase.expose(),
-            &salt,
-            memory_kib,
-            iterations,
-            parallelism,
-        )
-        .map_err(|e| format!("Failed to derive passphrase key: {}", e))?;
-        let (wrapped_dek, wrap_nonce) = wrap_dek(
-            &ctx,
-            &dek,
-            &file_wrapping_key,
-            slot_kind,
-            slot_id,
-            policy::KdfAlgorithm::Argon2id as u16,
-            memory_kib,
-            iterations,
-            parallelism,
-            &salt,
-        )
-        .map_err(|e| format!("Failed to wrap DEK: {}", e))?;
-        key_slots.push(KeySlotEntry {
-            kind: slot_kind,
-            slot_id,
-            kdf_algorithm: policy::KdfAlgorithm::Argon2id as u16,
-            argon2_memory_kib: memory_kib,
-            argon2_iterations: iterations,
-            argon2_parallelism: parallelism,
-            salt,
-            wrap_nonce,
-            wrapped_dek,
-        });
-    }
-
-    let original_name = std::path::Path::new(&path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Encrypted file");
-    let mime_type = inferred_mime_type(&path);
-    let metadata_plaintext = if protect_metadata {
-        serde_json::to_vec(&ProtectedFileMetadata {
-            schema_version: 1,
-            original_name,
-            mime_type,
-        })
-        .map_err(|e| format!("Failed to encode protected metadata: {}", e))?
+    // A large upload continues an earlier attempt for the same unchanged file.
+    let source_path = std::path::Path::new(&path);
+    let resumable = if plaintext_size > RESUMABLE_FROM_BYTES {
+        Some(ResumableUpload::new(
+            &transfer_account,
+            session_key(
+                folder_id,
+                source_path,
+                &format!(
+                    "protected:{}:{protect_metadata}",
+                    protection_mode.registry_name()
+                ),
+            ),
+            SourceFingerprint::of(source_path).await?,
+        ))
     } else {
-        Vec::new()
+        None
     };
-
-    // Create encryption session with a protected original name and MIME type.
-    let session = EncryptionSession::new_with_keys(
-        plaintext_size,
-        key_slots,
-        metadata_plaintext,
-        dek,
-        file_uuid,
-        nonce_prefix,
-    )
-    .map_err(|e| format!("Failed to create encryption session: {}", e))?;
-
-    let ciphertext_size = calculate_ciphertext_length(
-        plaintext_size,
-        policy::DEFAULT_CHUNK_SIZE,
-        session.header_bytes.len() as u32,
-    )
-    .map_err(|e| format!("Ciphertext size overflow: {}", e))?;
-
-    // RAII reservation prevents quota leaks on every error and cancellation path.
-    let mut bandwidth_reservation =
-        BandwidthReservation::upload(bw_state.inner().clone(), ciphertext_size)?;
 
     let tid = transfer_id.unwrap_or_default();
 
@@ -2170,120 +2926,21 @@ async fn cmd_upload_file_encrypted(
         );
     }
 
-    // Use the standard plaintext-relative progress reader under encryption.
-    let (reader, observed_plaintext_size, bytes_counter) = ProgressReader::new(&path).await?;
-    if observed_plaintext_size != plaintext_size {
-        return Err("Source file size changed before encryption started".to_string());
-    }
-
-    let cancelled = state.cancelled_transfers.clone();
-    let progress_tid = tid.clone();
-    let progress_handle = app_handle.clone();
-    let progress_counter = bytes_counter.clone();
-    let progress_task = if tid.is_empty() {
-        None
-    } else {
-        Some(tokio::spawn(async move {
-            let mut last_bytes = 0u64;
-            let mut last_time = std::time::Instant::now();
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                let current = progress_counter.load(std::sync::atomic::Ordering::Relaxed);
-                let now = std::time::Instant::now();
-                let elapsed = now.duration_since(last_time).as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    ((current.saturating_sub(last_bytes)) as f64 / elapsed) as u64
-                } else {
-                    0
-                };
-                let percent = if plaintext_size == 0 {
-                    0
-                } else {
-                    ((current as f64 / plaintext_size as f64) * 100.0).min(99.0) as u8
-                };
-                let _ = progress_handle.emit(
-                    "upload-progress",
-                    ProgressPayload {
-                        id: progress_tid.clone(),
-                        percent,
-                        uploaded_bytes: current,
-                        total_bytes: plaintext_size,
-                        speed_bytes_per_sec: speed,
-                    },
-                );
-                last_bytes = current;
-                last_time = now;
-                if current >= plaintext_size || cancelled.read().await.contains(&progress_tid) {
-                    break;
-                }
-            }
-        }))
-    };
-
-    // Wrap with EncryptingReader
-    let mut encrypting_reader = EncryptingReader::new(reader, session);
-
-    // Extract session info BEFORE the reader is moved into the spawn closure
-    let file_uuid = encrypting_reader.session.file_uuid;
-    let header_bytes_for_registry = encrypting_reader.session.header_bytes.clone();
-    let b32_name = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(file_uuid);
-    let remote_name = format!("tdrive_{}.tdenc", &b32_name[..b32_name.len().min(32)]);
-    let remote_name_for_spawn = remote_name.clone();
+    let bytes_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let _progress = spawn_upload_progress(
+        &app_handle,
+        state.cancelled_transfers.clone(),
+        &tid,
+        plaintext_size,
+        bytes_counter.clone(),
+    );
 
     // Check cancellation before starting
     if state.cancelled_transfers.read().await.contains(&tid) {
         state.cancelled_transfers.write().await.remove(&tid);
-        if let Some(task) = progress_task {
-            task.abort();
-        }
         return Err("Transfer cancelled".to_string());
     }
-
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    if !tid.is_empty() {
-        get_upload_cancellations()
-            .lock()
-            .unwrap()
-            .insert(tid.clone(), cancel_tx);
-    }
-
-    let client_clone = client.clone();
-    let mut upload_task = tokio::spawn(async move {
-        client_clone
-            .upload_stream(
-                &mut encrypting_reader,
-                ciphertext_size as usize,
-                remote_name_for_spawn,
-            )
-            .await
-    });
-
-    let upload_result = {
-        tokio::select! {
-            res = &mut upload_task => {
-                if !tid.is_empty() {
-                    get_upload_cancellations().lock().unwrap().remove(&tid);
-                }
-                res.map_err(|e| {
-                    format!("Task join error: {}", e)
-                })?
-            }
-            _ = cancel_rx => {
-                log::info!("Aborting encrypted upload for transfer ID: {}", tid);
-                upload_task.abort();
-                state.cancelled_transfers.write().await.remove(&tid);
-                if let Some(task) = progress_task { task.abort(); }
-                return Err("Transfer cancelled".to_string());
-            }
-        }
-    };
-
-    if let Some(task) = progress_task {
-        task.abort();
-    }
-
-    let _uploaded_file = upload_result.map_err(map_error)?;
-    let message = InputMessage::new().text("TDENC2").file(_uploaded_file);
+    let (_cancellation, mut cancel_rx) = UploadCancellation::register(&tid);
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
@@ -2291,95 +2948,212 @@ async fn cmd_upload_file_encrypted(
     let base_ms = net_config.retry_base_backoff_ms();
     let max_ms = net_config.retry_max_backoff_ms();
     let respect_flood = net_config.should_respect_flood_wait();
-    let mut last_err = String::new();
+    let mut restarted = false;
 
-    for attempt in 0..=max_retries {
+    loop {
+        // The envelope an interrupted attempt began is continued only when it
+        // is exactly the envelope this upload would create. Keys are never
+        // reused for different content.
+        let recorded_header = match &resumable {
+            Some(resumable) => resumable
+                .session()
+                .await?
+                .and_then(|session| session.envelope_header_bytes()),
+            None => None,
+        };
+        bytes_counter.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (reader, observed_plaintext_size) =
+            ProgressReader::with_counter(&path, bytes_counter.clone()).await?;
+        if observed_plaintext_size != plaintext_size {
+            return Err("Source file size changed before encryption started".to_string());
+        }
+        let ProtectedUploadStream {
+            reader: mut encrypting_reader,
+            header: header_bytes_for_registry,
+            file_uuid,
+            remote_name,
+            ciphertext_size,
+            continued,
+        } = protected_upload_stream_off_worker(
+            reader,
+            plaintext_size,
+            protection_mode.registry_name(),
+            vault_wrapping_key.as_ref(),
+            prompt_secret.as_ref(),
+            metadata_plaintext.clone(),
+            recorded_header.as_deref(),
+        )
+        .await?;
         transfer_account.validate()?;
-        match client.send_message(&peer, message.clone()).await {
-            Ok(_sent) => {
-                bandwidth_reservation.commit();
-                if !tid.is_empty() {
-                    let _ = app_handle.emit(
-                        "upload-progress",
-                        ProgressPayload {
-                            id: tid,
-                            percent: 100,
-                            uploaded_bytes: plaintext_size,
-                            total_bytes: plaintext_size,
-                            speed_bytes_per_sec: 0,
-                        },
-                    );
-                }
-                let folder_key = folder_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "home".to_string());
-                let header_sha256 = Sha256::digest(&header_bytes_for_registry).to_vec();
-                let record = EncryptedFileRecord {
-                    folder_key,
-                    message_id: _sent.id(),
-                    file_uuid: file_uuid.to_vec(),
-                    envelope_version: policy::FORMAT_VERSION,
-                    cipher_suite: policy::CIPHER_SUITE_XCHACHA20_POLY1305,
-                    ciphertext_size,
-                    plaintext_size: Some(plaintext_size),
-                    remote_name: remote_name.clone(),
-                    key_profile_id: Some(protection_mode.registry_name().to_string()),
-                    protection_mode: protection_mode.registry_name().to_string(),
-                    metadata_protected: protect_metadata,
-                    header_blob: Some(header_bytes_for_registry.clone()),
-                    header_sha256: Some(header_sha256),
-                    record_state: EncryptedFileState::Active,
-                    reconciliation_state: "ok".to_string(),
-                    created_at: chrono::Utc::now().timestamp(),
-                    last_verified_at: None,
-                };
-                let registry_result =
-                    crate::db::with_connection(db_pool.inner().clone(), move |connection| {
-                        upsert_encrypted_file(connection, &record)
-                            .map_err(|error| error.to_string())
-                    })
-                    .await;
-                if let Err(error) = registry_result {
-                    log::error!(
-                        "Encrypted upload {} succeeded as message {}, but registry reconciliation is required: {}",
-                        remote_name,
-                        _sent.id(),
-                        error
-                    );
+        if let Some(session) = vault_session {
+            crypto_state
+                .with_current_session(session, || ())
+                .map_err(|_| {
+                    "[VAULT_LOCKED] Upload credential changed during preparation".to_string()
+                })?;
+        }
+        if state.cancelled_transfers.read().await.contains(&tid) {
+            return Err("Transfer cancelled".to_string());
+        }
+        if recorded_header.is_some() && !continued {
+            if let Some(resumable) = &resumable {
+                resumable.discard().await?;
+            }
+        }
+
+        // RAII reservation prevents quota leaks on every error and cancellation path.
+        let mut bandwidth_reservation = match admitted_upload.take() {
+            Some(mut hold) => {
+                hold.resize(ciphertext_size)?;
+                hold
+            }
+            None => BandwidthReservation::upload(bw_state.inner().clone(), ciphertext_size)?,
+        };
+
+        let (uploaded_file, resumed) = match send_upload_stream(
+            &client,
+            resumable.as_ref(),
+            &mut encrypting_reader,
+            ciphertext_size,
+            remote_name.clone(),
+            Some(&header_bytes_for_registry),
+            &mut cancel_rx,
+            crate::traffic::Traffic {
+                network: net_config.inner().clone(),
+                account: transfer_account.clone(),
+                direction: crate::traffic::Direction::Upload,
+            },
+        )
+        .await?
+        {
+            SentParts::Done { file, resumed } => (file, resumed),
+            SentParts::Restart if !restarted => {
+                restarted = true;
+                continue;
+            }
+            SentParts::Restart => {
+                return Err("The upload could not be restarted cleanly; try again".to_string())
+            }
+            SentParts::Cancelled => {
+                log::info!("Aborting encrypted upload for transfer ID: {}", tid);
+                state.cancelled_transfers.write().await.remove(&tid);
+                return Err("Transfer cancelled".to_string());
+            }
+        };
+
+        let message = InputMessage::new().text("TDENC2").file(uploaded_file);
+
+        let mut last_err = String::new();
+        for attempt in 0..=max_retries {
+            transfer_account.validate()?;
+            match client.send_message(&peer, message.clone()).await {
+                Ok(_sent) => {
+                    crate::file_inventory::changed(&transfer_account, folder_id, &[])?;
+                    bandwidth_reservation.commit();
+                    if let Some(resumable) = &resumable {
+                        // Published: there is nothing left to continue.
+                        if let Err(error) = resumable.discard().await {
+                            log::warn!("Could not clear finished upload progress: {error}");
+                        }
+                    }
+                    if !tid.is_empty() {
+                        let _ = app_handle.emit(
+                            "upload-progress",
+                            ProgressPayload {
+                                id: tid.clone(),
+                                percent: 100,
+                                uploaded_bytes: plaintext_size,
+                                total_bytes: plaintext_size,
+                                speed_bytes_per_sec: 0,
+                            },
+                        );
+                    }
+                    let folder_key = folder_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "home".to_string());
+                    let header_sha256 = Sha256::digest(&header_bytes_for_registry).to_vec();
+                    let record = EncryptedFileRecord {
+                        folder_key,
+                        message_id: _sent.id(),
+                        file_uuid: file_uuid.to_vec(),
+                        envelope_version: policy::FORMAT_VERSION,
+                        cipher_suite: policy::CIPHER_SUITE_XCHACHA20_POLY1305,
+                        ciphertext_size,
+                        plaintext_size: Some(plaintext_size),
+                        remote_name: remote_name.clone(),
+                        key_profile_id: Some(protection_mode.registry_name().to_string()),
+                        protection_mode: protection_mode.registry_name().to_string(),
+                        metadata_protected: protect_metadata,
+                        header_blob: Some(header_bytes_for_registry.clone()),
+                        header_sha256: Some(header_sha256),
+                        record_state: EncryptedFileState::Active,
+                        reconciliation_state: "ok".to_string(),
+                        created_at: chrono::Utc::now().timestamp(),
+                        last_verified_at: None,
+                    };
+                    let registry_result =
+                        crate::db::with_connection(db_pool.inner().clone(), move |connection| {
+                            upsert_encrypted_file(connection, &record)
+                                .map_err(|error| error.to_string())
+                        })
+                        .await;
+                    if let Err(error) = registry_result {
+                        log::error!(
+                            "Encrypted upload {} succeeded as message {}, but registry reconciliation is required: {}",
+                            remote_name,
+                            _sent.id(),
+                            error
+                        );
+                    }
                     return Ok(_sent.id().to_string());
                 }
-                return Ok(_sent.id().to_string());
-            }
-            Err(e) => {
-                let err = map_error(e);
-                log::warn!(
-                    "send_message attempt {}/{}: {}",
-                    attempt + 1,
-                    max_retries + 1,
-                    err
-                );
-                if respect_flood && err.starts_with("FLOOD_WAIT_") {
-                    if let Ok(secs) = err.trim_start_matches("FLOOD_WAIT_").parse::<u64>() {
-                        let wait = secs.min(300);
-                        wait_for_telegram_cooldown(&app_handle, "Protected upload", wait).await;
+                Err(e) => {
+                    let err = map_error(e);
+                    log::warn!(
+                        "send_message attempt {}/{}: {}",
+                        attempt + 1,
+                        max_retries + 1,
+                        err
+                    );
+                    if parts_unusable(&err) {
+                        // Repeating the request cannot bring the parts back.
                         last_err = err;
-                        continue;
+                        break;
                     }
-                }
-                last_err = err;
-                if attempt < max_retries {
-                    let delay = backoff_ms(attempt, base_ms, max_ms);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    if respect_flood && err.starts_with("FLOOD_WAIT_") {
+                        if let Ok(secs) = err.trim_start_matches("FLOOD_WAIT_").parse::<u64>() {
+                            let wait = secs.min(300);
+                            wait_for_telegram_cooldown(&app_handle, "Protected upload", wait).await;
+                            last_err = err;
+                            continue;
+                        }
+                    }
+                    last_err = err;
+                    if attempt < max_retries {
+                        let delay = backoff_ms(attempt, base_ms, max_ms);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
                 }
             }
         }
-    }
 
-    Err(format!(
-        "Encrypted upload failed after {} attempts: {}",
-        max_retries + 1,
-        last_err
-    ))
+        if parts_unusable(&last_err) {
+            // Discarding the record also retires this envelope: the next
+            // attempt encrypts under new keys.
+            if let Some(resumable) = &resumable {
+                resumable.discard().await?;
+            }
+            if resumed && !restarted {
+                restarted = true;
+                continue;
+            }
+        }
+        return Err(format!(
+            "Encrypted upload failed after {} attempts: {}",
+            max_retries + 1,
+            last_err
+        ));
+    }
 }
 
 #[tauri::command]
@@ -2392,6 +3166,7 @@ pub async fn initiate_upload(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
@@ -2409,6 +3184,7 @@ pub async fn initiate_upload(
         prompt_token,
         protect_metadata,
         video_upload_mode,
+        video_filename_caption,
         app_handle,
         state,
         bw_state,
@@ -2850,6 +3626,7 @@ async fn cmd_download_file_owned(
     let mut last_emit_time = std::time::Instant::now();
     let mut last_emit_bytes: u64 = 0;
     let mut chunk_retry_budget = net_config.retry_attempts();
+    let mut chunks_received: i32 = 0;
 
     while let Some(chunk) = download_iter.next().await.transpose() {
         // Check cancellation
@@ -2861,6 +3638,7 @@ async fn cmd_download_file_owned(
         let bytes = match chunk {
             Ok(b) => {
                 chunk_retry_budget = net_config.retry_attempts(); // reset on success
+                chunks_received += 1;
                 b
             }
             Err(e) => {
@@ -2878,11 +3656,15 @@ async fn cmd_download_file_owned(
                         net_config.retry_max_backoff_ms(),
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    // The iterator is spent after an error and would report
+                    // end of stream. Resume after the chunks already written.
+                    download_iter = client.iter_download(&media).skip_chunks(chunks_received);
                     continue;
                 }
                 return Err(format!("Download chunk error: {}", err));
             }
         };
+        pace_download(&net_config, &transfer_account, &state, &tid, bytes.len()).await?;
         tokio::io::AsyncWriteExt::write_all(&mut file, &bytes)
             .await
             .map_err(|error| format!("Failed to write download staging file: {error}"))?;
@@ -2915,19 +3697,6 @@ async fn cmd_download_file_owned(
                 );
                 last_emit_time = now;
                 last_emit_bytes = downloaded;
-            }
-        }
-
-        // Bandwidth throttle: if download limit is set, sleep to maintain rate
-        let dl_limit = net_config.download_limit_bytes_per_sec();
-        if dl_limit > 0 {
-            let elapsed = last_emit_time.elapsed().as_secs_f64().max(0.001);
-            let current_rate = (downloaded - last_emit_bytes) as f64 / elapsed;
-            if current_rate > dl_limit as f64 {
-                let sleep_ms = ((current_rate / dl_limit as f64 - 1.0) * elapsed * 1000.0) as u64;
-                if sleep_ms > 0 && sleep_ms < 5000 {
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                }
             }
         }
     }
@@ -3105,7 +3874,7 @@ async fn cmd_download_encrypted_file(
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
-    _net_config: State<'_, std::sync::Arc<NetworkConfig>>,
+    net_config: State<'_, std::sync::Arc<NetworkConfig>>,
     crypto_state: State<'_, crate::crypto::state::CryptoState>,
     db_pool: State<'_, DbConnection>,
     client: grammers_client::Client,
@@ -3163,7 +3932,9 @@ async fn cmd_download_encrypted_file(
     let mut downloaded_ciphertext = 0u64;
     let mut header_bytes = Vec::with_capacity(policy::MAX_HEADER_LENGTH);
     let mut expected_header_length: Option<usize> = None;
-    let vault_key = crypto_state.get_current_wrapping_key().ok();
+    let credential = crypto_state.current_credential().ok();
+    let vault_session = credential.as_ref().map(|(id, _)| *id);
+    let vault_key = credential.map(|(_, key)| key);
     let prompt_passphrase = match prompt_token {
         Some(token) => Some(
             crypto_state
@@ -3193,14 +3964,47 @@ async fn cmd_download_encrypted_file(
     let mut output_file: Option<tokio::fs::File> = None;
     let mut plaintext_written = 0u64;
     let mut decoded_metadata: Option<DecodedProtectedFileMetadata> = None;
+    let mut chunk_retry_budget = net_config.retry_attempts();
+    let mut chunks_received: i32 = 0;
 
     while let Some(chunk) = download_iter.next().await.transpose() {
         if state.cancelled_transfers.read().await.contains(&tid) {
             state.cancelled_transfers.write().await.remove(&tid);
             return Err("Transfer cancelled".to_string());
         }
-        let bytes =
-            chunk.map_err(|error| format!("Download chunk error: {}", map_error(&error)))?;
+        // A dropped connection retries the same chunk, as plain downloads do.
+        // Nothing has been fed to the decryptor for a failed chunk, so the
+        // authenticated stream continues from exactly where it stopped.
+        let bytes = match chunk {
+            Ok(bytes) => {
+                chunk_retry_budget = net_config.retry_attempts();
+                chunks_received += 1;
+                bytes
+            }
+            Err(error) => {
+                let error = map_error(&error);
+                if chunk_retry_budget > 0 {
+                    chunk_retry_budget -= 1;
+                    log::warn!(
+                        "Encrypted download chunk error (retries left: {}): {}",
+                        chunk_retry_budget,
+                        error
+                    );
+                    let delay = backoff_ms(
+                        0,
+                        net_config.retry_base_backoff_ms(),
+                        net_config.retry_max_backoff_ms(),
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    // The iterator is spent after an error and would report
+                    // end of stream. Resume after the chunks already decrypted.
+                    download_iter = client.iter_download(&media).skip_chunks(chunks_received);
+                    continue;
+                }
+                return Err(format!("Download chunk error: {}", error));
+            }
+        };
+        pace_download(&net_config, &transfer_account, &state, &tid, bytes.len()).await?;
         downloaded_ciphertext = downloaded_ciphertext.saturating_add(bytes.len() as u64);
         if downloaded_ciphertext > ciphertext_size {
             return Err("Encrypted download exceeded its declared size".to_string());
@@ -3260,11 +4064,26 @@ async fn cmd_download_encrypted_file(
                             )
                         })
                         .await?;
-                        let reader = initialize_tdenc2_decryptor(
+                        let (reader, uses_vault) = initialize_tdenc2_decryptor_off_worker(
                             &header_bytes,
                             vault_key.as_ref(),
                             prompt_passphrase.as_ref(),
-                        )?;
+                        )
+                        .await?;
+                        transfer_account.validate()?;
+                        if uses_vault {
+                            let session = vault_session
+                                .ok_or("[VAULT_LOCKED] Download credential changed")?;
+                            crypto_state
+                                .with_current_session(session, || ())
+                                .map_err(|_| {
+                                    "[VAULT_LOCKED] Download credential changed during preparation"
+                                        .to_string()
+                                })?;
+                        }
+                        if state.cancelled_transfers.read().await.contains(&tid) {
+                            return Err("Transfer cancelled".to_string());
+                        }
                         let mut authenticated_record = probed_record;
                         authenticated_record.reconciliation_state =
                             "header_authenticated".to_string();
@@ -3544,276 +4363,258 @@ struct FolderLoadPayload {
 }
 
 async fn finalize_folder_scan(
-    account: &crate::workspace::AccountGuard,
+    publication: &crate::file_inventory::Publication,
+    crypto: &crate::crypto::state::CryptoState,
     folder_id: Option<i64>,
     request_id: &str,
     files: Vec<FileMetadata>,
     complete: bool,
     database: DbConnection,
 ) -> Result<FolderLoadResult, String> {
-    account.validate()?;
+    let account = &publication.account;
+    publication.ticket.validate(account)?;
     if !complete {
         return Ok(FolderLoadResult::incomplete(account, folder_id, request_id));
     }
-    // A terminal success certifies both inventories. Never prune the account
-    // catalog after a failed legacy inventory transaction.
     crate::commands::file_inventory::complete_inventory_scan(
         database,
         crate::commands::file_inventory::folder_key(folder_id),
         request_id.into(),
+        Some(publication.clone()),
     )
     .await?;
-    crate::workspace::complete_scan(account, folder_id, request_id).await?;
-    account.validate()?;
-    Ok(FolderLoadResult {
-        owner_id: account.owner.to_string(),
-        folder_id,
-        request_id: request_id.into(),
-        complete: true,
-        files,
+    crate::workspace::complete_scan(publication, folder_id, request_id).await?;
+    publication.output(crypto, &files, || {
+        Ok(FolderLoadResult {
+            owner_id: account.owner.to_string(),
+            folder_id,
+            request_id: request_id.into(),
+            complete: true,
+            files: files.clone(),
+        })
     })
 }
-
+#[allow(clippy::too_many_arguments)] // Scope/credential accompany the existing streaming publication contract.
 async fn publish_folder_chunk(
     app: &tauri::AppHandle,
-    account: &crate::workspace::AccountGuard,
+    publication: &crate::file_inventory::Publication,
+    crypto: &crate::crypto::state::CryptoState,
     peer: &Peer,
     folder_id: Option<i64>,
     request_id: &str,
     files: Vec<FileMetadata>,
     database: DbConnection,
 ) -> Result<Vec<FileMetadata>, String> {
-    account.validate()?;
-    crate::workspace::record_chunk(account, &files, peer, request_id).await?;
+    crate::workspace::record_chunk(publication, &files, peer, request_id).await?;
     crate::commands::file_inventory::upsert_inventory_chunk(
         database,
         crate::commands::file_inventory::folder_key(folder_id),
         request_id.into(),
         files.clone(),
+        Some(publication.clone()),
     )
     .await?;
-    account.validate()?;
-    let _ = app.emit(
-        "folder-load-chunk",
-        FolderLoadPayload {
-            owner_id: account.owner.to_string(),
-            folder_id,
-            request_id: request_id.into(),
-            files: files.clone(),
-        },
-    );
-    Ok(files)
+    publication.output(crypto, &files, || {
+        let _ = app.emit(
+            "folder-load-chunk",
+            FolderLoadPayload {
+                owner_id: publication.account.owner.to_string(),
+                folder_id,
+                request_id: request_id.into(),
+                files: files.clone(),
+            },
+        );
+        Ok(files.clone())
+    })
 }
 
-#[cfg(test)]
-mod folder_listing_tests {
-    use super::*;
-    use crate::workspace::{store::Store, AccountGuard};
-    use grammers_session::{storages::SqliteSession, types::PeerInfo, Session};
-    use std::path::PathBuf;
-
-    fn file(id: i64, folder_id: Option<i64>) -> FileMetadata {
-        FileMetadata {
-            id,
-            folder_id,
-            name: format!("File{id}.txt"),
-            size: 4,
-            mime_type: Some("text/plain".into()),
-            file_ext: Some("txt".into()),
-            created_at: "2026-09-10T00:00:00Z".into(),
-            icon_type: "file".into(),
-            encryption_state: "plain".into(),
-            is_favorite: false,
-            is_pinned: false,
+pub(crate) struct InventoryMetadataReader<'a> {
+    pub account: &'a crate::workspace::AccountGuard,
+    pub client: &'a grammers_client::Client,
+    pub folder: Option<i64>,
+    pub vault_key: Option<&'a SecretKey>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    header_budget: ListingHeaderBudget,
+}
+impl<'a> InventoryMetadataReader<'a> {
+    pub(crate) fn new(
+        account: &'a crate::workspace::AccountGuard,
+        client: &'a grammers_client::Client,
+        folder: Option<i64>,
+        vault_key: Option<&'a SecretKey>,
+    ) -> Self {
+        Self {
+            account,
+            client,
+            folder,
+            vault_key,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            header_budget: ListingHeaderBudget::default(),
         }
     }
-    struct Fixture {
-        root: PathBuf,
-        account: AccountGuard,
-        database: DbConnection,
-    }
-    impl Fixture {
-        fn new() -> Self {
-            let root =
-                std::env::temp_dir().join(format!("folder-refresh-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&root).unwrap();
-            let session = SqliteSession::open(root.join("telegram.session")).unwrap();
-            session.cache_peer(&PeerInfo::User {
-                id: 100,
-                auth: None,
-                bot: Some(false),
-                is_self: Some(true),
-            });
-            drop(session);
-            let store = Store::open(&root, 100).unwrap();
-            store
-                .remember_files(&[file(1, None), file(2, None)], "Saved Messages", "old")
-                .unwrap();
-            store
-                .remember_files(&[file(2, None)], "Saved Messages", "current")
-                .unwrap();
-            store
-                .remember_files(&[file(1, Some(9))], "Other folder", "old")
-                .unwrap();
-            Store::open(&root, 200)
-                .unwrap()
-                .remember_files(&[file(1, None)], "Other owner", "old")
-                .unwrap();
-            let connection = sqlite::open(":memory:").unwrap();
-            connection.execute("CREATE TABLE file_inventory (folder_key TEXT, message_id INTEGER, last_seen_scan TEXT);
-                CREATE TABLE file_inventory_state (folder_key TEXT PRIMARY KEY, completed_at INTEGER, file_count INTEGER);
-                INSERT INTO file_inventory VALUES ('home',1,'old'),('home',2,'current'),('9',1,'old');").unwrap();
-            Self {
-                account: AccountGuard::open(&root, Some("100")).unwrap(),
-                root,
-                database: Arc::new(Mutex::new(connection)),
-            }
-        }
-        fn ids(&self, owner: i64, folder: Option<i64>) -> Vec<i64> {
-            Store::open(&self.root, owner)
-                .unwrap()
-                .folder_files(folder)
-                .unwrap()
-                .into_iter()
-                .map(|file| file.id)
-                .collect()
-        }
-    }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-
-    #[tokio::test]
-    async fn complete_snapshot_prunes_absent_files_only_in_its_account_and_folder() {
-        let fixture = Fixture::new();
-        assert_eq!(fixture.ids(100, None), vec![2, 1]);
-        let response = finalize_folder_scan(
-            &fixture.account,
-            None,
-            "current",
-            vec![file(2, None)],
-            true,
-            fixture.database.clone(),
-        )
-        .await
-        .unwrap();
-        assert!(response.complete);
-        assert_eq!(
-            response
-                .files
-                .iter()
-                .map(|file| file.id)
-                .collect::<Vec<_>>(),
-            vec![2]
-        );
-        let wire = serde_json::to_value(response).unwrap();
-        assert_eq!(wire["ownerId"], "100");
-        assert_eq!(wire["requestId"], "current");
-        assert!(wire["folderId"].is_null());
-        assert_eq!(fixture.ids(100, None), vec![2]);
-        assert_eq!(fixture.ids(100, Some(9)), vec![1]);
-        assert_eq!(fixture.ids(200, None), vec![1]);
-    }
-
-    #[tokio::test]
-    async fn capped_repeated_or_superseded_scans_cannot_certify_a_partial_snapshot() {
-        let fixture = Fixture::new();
-        for request in ["capped", "repeated", "superseded"] {
-            let response = finalize_folder_scan(
-                &fixture.account,
-                None,
-                request,
-                vec![file(2, None)],
-                false,
-                fixture.database.clone(),
+    pub(crate) async fn read(
+        &mut self,
+        msg: &grammers_client::types::Message,
+        flags: (bool, bool),
+    ) -> Result<Option<FileMetadata>, String> {
+        let workspace_account = self.account;
+        let client = self.client;
+        let folder_id = self.folder;
+        let vault_key = self.vault_key;
+        let (is_favorite, is_pinned) = flags;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let header_budget = &mut self.header_budget;
+        workspace_account.validate()?;
+        if let Some(doc) = msg.media() {
+            let declared_size = media_size(&doc);
+            let (mut name, mut size, mut mime, mut ext, remote_document_name) = match &doc {
+                Media::Document(d) => {
+                    let doc_name = d.name().to_string();
+                    // Prefer the message caption (set by rename via EditMessage) over the
+                    // document's built-in filename attribute, so renames persist across refreshes.
+                    let caption = msg.text();
+                    let display_name = if caption.is_empty() {
+                        doc_name.clone()
+                    } else {
+                        caption.to_string()
+                    };
+                    let m = d.mime_type().map(|s| s.to_string());
+                    // Extension always from the original document name for correct file-type icon
+                    let e = std::path::Path::new(&doc_name)
+                        .extension()
+                        .map(|os| os.to_str().unwrap_or("").to_string());
+                    (display_name, declared_size, m, e, doc_name)
+                }
+                Media::Photo(_) => (
+                    "Photo.jpg".to_string(),
+                    declared_size,
+                    Some("image/jpeg".into()),
+                    Some("jpg".into()),
+                    "Photo.jpg".to_string(),
+                ),
+                _ => ("Unknown".to_string(), 0, None, None, "Unknown".to_string()),
+            };
+            let file_id_i64 = msg.id() as i64;
+            let msg_id_i32 = msg.id();
+            let suspected_tdenc2 = name == "TDENC2"
+                || remote_document_name
+                    .to_ascii_lowercase()
+                    .ends_with(".tdenc");
+            let mut probe_failed = false;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let mut probe_deferred = false;
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let probe_deferred = false;
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let envelope_result = resolve_remote_envelope(
+                workspace_account,
+                client,
+                folder_id,
+                msg_id_i32,
+                &doc,
+                msg.text(),
             )
-            .await
-            .unwrap();
-            assert!(!response.complete);
-            assert!(response.files.is_empty());
-            assert_eq!(fixture.ids(100, None), vec![2, 1]);
+            .await;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let envelope_result = resolve_remote_envelope_with_probe(
+                workspace_account,
+                folder_id,
+                msg_id_i32,
+                &doc,
+                msg.text(),
+                header_budget.probe(probe_tdenc2_header(workspace_account, client, &doc)),
+            )
+            .await;
+            let encrypted_record = match envelope_result {
+                Ok(record) => record,
+                Err(error) => {
+                    workspace_account.validate()?;
+                    log::warn!("TDENC2 probe failed for message {}: {}", msg_id_i32, error);
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    {
+                        probe_deferred = error == LISTING_HEADER_DEFERRED;
+                    }
+                    probe_failed = true;
+                    None
+                }
+            };
+            let encrypted_info = encrypted_record.as_ref();
+            let enc_state = if let Some(info) = encrypted_info {
+                if info.envelope_version != policy::FORMAT_VERSION {
+                    "encrypted_unsupported_version"
+                } else if vault_key.is_some()
+                    && matches!(
+                        info.protection_mode.as_str(),
+                        "vault" | "vault_and_passphrase"
+                    )
+                {
+                    "encrypted_unlocked"
+                } else {
+                    "encrypted_locked"
+                }
+            } else if probe_deferred {
+                // Lack of a network response is not an integrity failure.
+                // Keep it protected; opening it can retry independently.
+                "encrypted_locked"
+            } else if probe_failed && name == "TDENC2" {
+                "encrypted_corrupt"
+            } else if suspected_tdenc2 {
+                "encrypted_key_missing"
+            } else {
+                "plain"
+            };
+            if let Some(info) = encrypted_info {
+                if let Some(plaintext_size) = info.plaintext_size {
+                    size = plaintext_size;
+                }
+                if info.metadata_protected {
+                    name = "Encrypted file".to_string();
+                    mime = Some("application/octet-stream".to_string());
+                    ext = None;
+                    if let Some(header) = info.header_blob.as_deref() {
+                        if let Ok(reader) = initialize_tdenc2_decryptor(header, vault_key, None) {
+                            if let Ok(metadata) =
+                                serde_json::from_slice::<DecodedProtectedFileMetadata>(
+                                    reader.metadata_plaintext(),
+                                )
+                            {
+                                if metadata.schema_version == 1
+                                    && !metadata.original_name.is_empty()
+                                {
+                                    name = metadata.original_name;
+                                    mime = Some(metadata.mime_type);
+                                    ext = std::path::Path::new(&name)
+                                        .extension()
+                                        .and_then(|value| value.to_str())
+                                        .map(str::to_string);
+                                }
+                            }
+                        }
+                    }
+                } else if !info.remote_name.is_empty() && name == "TDENC2" {
+                    name = info.remote_name.clone();
+                }
+            } else if suspected_tdenc2 {
+                name = "Encrypted file".to_string();
+                mime = Some("application/octet-stream".to_string());
+                ext = None;
+            }
+            Ok(Some(FileMetadata {
+                id: file_id_i64,
+                folder_id,
+                name,
+                size,
+                mime_type: mime,
+                file_ext: ext,
+                created_at: msg.date().to_string(),
+                icon_type: "file".into(),
+                encryption_state: enc_state.to_string(),
+                is_favorite,
+                is_pinned,
+            }))
+        } else {
+            Ok(None)
         }
-    }
-
-    #[tokio::test]
-    async fn failed_inventory_finalization_preserves_the_owned_cached_snapshot() {
-        let fixture = Fixture::new();
-        crate::db::with_connection(fixture.database.clone(), |connection| {
-            connection
-                .execute("DROP TABLE file_inventory_state")
-                .map_err(|e| e.to_string())
-        })
-        .await
-        .unwrap();
-        assert!(finalize_folder_scan(
-            &fixture.account,
-            None,
-            "current",
-            vec![file(2, None)],
-            true,
-            fixture.database.clone()
-        )
-        .await
-        .is_err());
-        assert_eq!(fixture.ids(100, None), vec![2, 1]);
-        let count = crate::db::with_connection(fixture.database.clone(), |connection| {
-            let mut statement = connection
-                .prepare("SELECT COUNT(*) FROM file_inventory WHERE folder_key='home'")
-                .map_err(|e| e.to_string())?;
-            statement.next().map_err(|e| e.to_string())?;
-            statement.read::<i64, _>(0).map_err(|e| e.to_string())
-        })
-        .await
-        .unwrap();
-        assert_eq!(count, 2);
-    }
-
-    #[tokio::test]
-    async fn failed_account_scan_marker_rolls_back_owned_pruning() {
-        let fixture = Fixture::new();
-        Store::open(&fixture.root, 100).unwrap().db.execute(
-            "CREATE TRIGGER fail_scan_marker BEFORE INSERT ON workspace_records BEGIN SELECT RAISE(FAIL,'disk unavailable'); END;"
-        ).unwrap();
-        assert!(finalize_folder_scan(
-            &fixture.account,
-            None,
-            "current",
-            vec![file(2, None)],
-            true,
-            fixture.database.clone()
-        )
-        .await
-        .is_err());
-        assert_eq!(fixture.ids(100, None), vec![2, 1]);
-    }
-
-    #[tokio::test]
-    async fn a_changed_account_cannot_finalize_an_old_scan() {
-        let fixture = Fixture::new();
-        std::fs::remove_file(fixture.root.join("telegram.session")).unwrap();
-        let session = SqliteSession::open(fixture.root.join("telegram.session")).unwrap();
-        session.cache_peer(&PeerInfo::User {
-            id: 200,
-            auth: None,
-            bot: Some(false),
-            is_self: Some(true),
-        });
-        drop(session);
-        assert!(finalize_folder_scan(
-            &fixture.account,
-            None,
-            "current",
-            vec![],
-            true,
-            fixture.database.clone()
-        )
-        .await
-        .unwrap_err()
-        .contains("ACCOUNT_CHANGED"));
-        assert_eq!(fixture.ids(100, None), vec![2, 1]);
-        assert_eq!(fixture.ids(200, None), vec![1]);
     }
 }
 
@@ -3821,12 +4622,13 @@ mod folder_listing_tests {
 pub async fn cmd_get_files(
     folder_id: Option<i64>,
     request_id: Option<String>,
+    force_poll: Option<bool>,
     owner_id: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
-    db_pool: State<'_, DbConnection>,
     crypto_state: State<'_, crate::crypto::state::CryptoState>,
 ) -> Result<FolderLoadResult, String> {
+    let db_pool = app_handle.state::<DbConnection>();
     let root = app_handle
         .path()
         .app_data_dir()
@@ -3883,35 +4685,44 @@ pub async fn cmd_get_files(
                 return Err(error);
             }
         };
-        let vault_key = crypto_state.get_current_wrapping_key().ok();
+        let credential = crypto_state.current_credential().ok();
+        let (vault_session, vault_key) = match credential {
+            Some((session, key)) => (Some(session), Some(key)),
+            None => (None, None),
+        };
         workspace_account.validate()?;
 
-        let mut msgs = client.iter_messages(&peer);
+        let listing = crate::file_inventory::messages_refresh(
+            &workspace_account,
+            state.inner(),
+            folder_id,
+            force_poll.unwrap_or(false),
+        )
+        .await?;
+        let publication = crate::file_inventory::Publication {
+            account: workspace_account.clone(),
+            ticket: listing.ticket,
+            credential: vault_session,
+        };
+        let mut msgs = listing.rows.iter();
         let mut last_msg_id: Option<i32> = None;
         let mut file_count = 0usize;
-        let mut scan_complete = true;
-        const MAX_FILES_LIMIT: usize = 50000; // Hard safety cap to prevent infinite loops (50,000 files)
+        let mut scan_complete = listing.complete;
         const FILE_CHUNK_SIZE: usize = 50;
         const FILE_CHUNK_MAX_LATENCY: std::time::Duration = std::time::Duration::from_millis(400);
 
         let mut chunk = Vec::new();
         let mut all_files = Vec::new();
         let mut last_chunk_emitted = std::time::Instant::now();
+        let mut metadata_reader = InventoryMetadataReader::new(
+            &workspace_account,
+            &client,
+            folder_id,
+            vault_key.as_ref(),
+        );
 
         loop {
-            let next_message = match msgs.next().await {
-                Ok(message) => message,
-                Err(error) => {
-                    let mut active = active_file_loads.write().await;
-                    if active
-                        .get(&registration_key)
-                        .is_some_and(|current| current == &request_id)
-                    {
-                        active.remove(&registration_key);
-                    }
-                    return Err(error.to_string());
-                }
-            };
+            let next_message = msgs.next();
             let Some(msg) = next_message else {
                 break;
             };
@@ -3946,136 +4757,17 @@ pub async fn cmd_get_files(
             }
             last_msg_id = Some(current_msg_id);
 
-            if let Some(doc) = msg.media() {
-                let declared_size = media_size(&doc);
-                let (mut name, mut size, mut mime, mut ext, remote_document_name) = match &doc {
-                    Media::Document(d) => {
-                        let doc_name = d.name().to_string();
-                        // Prefer the message caption (set by rename via EditMessage) over the
-                        // document's built-in filename attribute, so renames persist across refreshes.
-                        let caption = msg.text();
-                        let display_name = if caption.is_empty() {
-                            doc_name.clone()
-                        } else {
-                            caption.to_string()
-                        };
-                        let m = d.mime_type().map(|s| s.to_string());
-                        // Extension always from the original document name for correct file-type icon
-                        let e = std::path::Path::new(&doc_name)
-                            .extension()
-                            .map(|os| os.to_str().unwrap_or("").to_string());
-                        (display_name, declared_size, m, e, doc_name)
-                    }
-                    Media::Photo(_) => (
-                        "Photo.jpg".to_string(),
-                        declared_size,
-                        Some("image/jpeg".into()),
-                        Some("jpg".into()),
-                        "Photo.jpg".to_string(),
-                    ),
-                    _ => ("Unknown".to_string(), 0, None, None, "Unknown".to_string()),
-                };
-                let file_id_i64 = msg.id() as i64;
-                let msg_id_i32 = msg.id();
-                let suspected_tdenc2 = name == "TDENC2"
-                    || remote_document_name
-                        .to_ascii_lowercase()
-                        .ends_with(".tdenc");
-                let mut probe_failed = false;
-                let encrypted_record = match resolve_remote_envelope(
-                    &workspace_account,
-                    &client,
-                    folder_id,
-                    msg_id_i32,
-                    &doc,
-                    msg.text(),
+            if let Some(file) = metadata_reader
+                .read(
+                    msg,
+                    activity_flags
+                        .get(&msg.id())
+                        .copied()
+                        .unwrap_or((false, false)),
                 )
-                .await
-                {
-                    Ok(record) => record,
-                    Err(error) => {
-                        workspace_account.validate()?;
-                        log::warn!("TDENC2 probe failed for message {}: {}", msg_id_i32, error);
-                        probe_failed = true;
-                        None
-                    }
-                };
-                let encrypted_info = encrypted_record.as_ref();
-                let enc_state = if let Some(info) = encrypted_info {
-                    if info.envelope_version != policy::FORMAT_VERSION {
-                        "encrypted_unsupported_version"
-                    } else if vault_key.is_some()
-                        && matches!(
-                            info.protection_mode.as_str(),
-                            "vault" | "vault_and_passphrase"
-                        )
-                    {
-                        "encrypted_unlocked"
-                    } else {
-                        "encrypted_locked"
-                    }
-                } else if probe_failed && name == "TDENC2" {
-                    "encrypted_corrupt"
-                } else if suspected_tdenc2 {
-                    "encrypted_key_missing"
-                } else {
-                    "plain"
-                };
-                if let Some(info) = encrypted_info {
-                    if let Some(plaintext_size) = info.plaintext_size {
-                        size = plaintext_size;
-                    }
-                    if info.metadata_protected {
-                        name = "Encrypted file".to_string();
-                        mime = Some("application/octet-stream".to_string());
-                        ext = None;
-                        if let Some(header) = info.header_blob.as_deref() {
-                            if let Ok(reader) =
-                                initialize_tdenc2_decryptor(header, vault_key.as_ref(), None)
-                            {
-                                if let Ok(metadata) =
-                                    serde_json::from_slice::<DecodedProtectedFileMetadata>(
-                                        reader.metadata_plaintext(),
-                                    )
-                                {
-                                    if metadata.schema_version == 1
-                                        && !metadata.original_name.is_empty()
-                                    {
-                                        name = metadata.original_name;
-                                        mime = Some(metadata.mime_type);
-                                        ext = std::path::Path::new(&name)
-                                            .extension()
-                                            .and_then(|value| value.to_str())
-                                            .map(str::to_string);
-                                    }
-                                }
-                            }
-                        }
-                    } else if !info.remote_name.is_empty() && name == "TDENC2" {
-                        name = info.remote_name.clone();
-                    }
-                } else if suspected_tdenc2 {
-                    name = "Encrypted file".to_string();
-                    mime = Some("application/octet-stream".to_string());
-                    ext = None;
-                }
-                let (is_favorite, is_pinned) = activity_flags
-                    .get(&msg_id_i32)
-                    .copied()
-                    .unwrap_or((false, false));
-                chunk.push(FileMetadata {
-                    id: file_id_i64,
-                    folder_id,
-                    name,
-                    size,
-                    mime_type: mime,
-                    file_ext: ext,
-                    created_at: msg.date().to_string(),
-                    icon_type: "file".into(),
-                    encryption_state: enc_state.to_string(),
-                    is_favorite,
-                    is_pinned,
-                });
+                .await?
+            {
+                chunk.push(file);
                 file_count += 1;
 
                 if chunk.len() >= FILE_CHUNK_SIZE
@@ -4095,7 +4787,8 @@ pub async fn cmd_get_files(
                     all_files.extend(
                         publish_folder_chunk(
                             &app_handle,
-                            &workspace_account,
+                            &publication,
+                            crypto_state.inner(),
                             &peer,
                             folder_id,
                             &request_id,
@@ -4106,11 +4799,6 @@ pub async fn cmd_get_files(
                     );
                     drop(active);
                     last_chunk_emitted = std::time::Instant::now();
-
-                    if file_count >= MAX_FILES_LIMIT {
-                        scan_complete = false;
-                        break;
-                    }
                 }
             }
         }
@@ -4130,7 +4818,8 @@ pub async fn cmd_get_files(
             all_files.extend(
                 publish_folder_chunk(
                     &app_handle,
-                    &workspace_account,
+                    &publication,
+                    crypto_state.inner(),
                     &peer,
                     folder_id,
                     &request_id,
@@ -4149,7 +4838,8 @@ pub async fn cmd_get_files(
             .get(&registration_key)
             .is_some_and(|current| current == &request_id);
         let response = finalize_folder_scan(
-            &workspace_account,
+            &publication,
+            crypto_state.inner(),
             folder_id,
             &request_id,
             all_files,
@@ -4181,143 +4871,29 @@ pub async fn cmd_get_files(
     result
 }
 
-/// Extract FileMetadata entries from a list of Telegram messages returned by SearchGlobal.
-fn search_created_at(timestamp: i32) -> String {
-    // Telegram's raw search response contains Unix seconds, whereas file lists
-    // expose a date string that JavaScript can parse consistently on all hosts.
-    chrono::DateTime::<chrono::Utc>::from_timestamp(i64::from(timestamp), 0)
-        .unwrap_or_default()
-        .to_rfc3339()
-}
-
-fn search_source_folder(peer: &tl::enums::Peer, owner: i64) -> Option<i64> {
-    match peer {
-        tl::enums::Peer::Channel(channel) => Some(channel.channel_id),
-        tl::enums::Peer::User(user) if user.user_id == owner => None,
-        tl::enums::Peer::User(user) => Some(user.user_id),
-        tl::enums::Peer::Chat(chat) => Some(chat.chat_id),
-    }
-}
-
-fn validate_search_client(
-    account: &crate::workspace::AccountGuard,
-    client_owner: i64,
-) -> Result<(), String> {
-    account.validate()?;
-    if account.owner != client_owner {
-        return Err("ACCOUNT_CHANGED: Search client belongs to another account".into());
-    }
-    Ok(())
-}
-
-fn extract_search_files(msgs: &[tl::enums::Message], owner: i64) -> Vec<FileMetadata> {
-    let mut files = Vec::new();
-    for msg in msgs {
-        if let tl::enums::Message::Message(m) = msg {
-            if let Some(tl::enums::MessageMedia::Document(d)) = &m.media {
-                if let Some(tl::enums::Document::Document(doc)) = &d.document {
-                    let doc_name = doc
-                        .attributes
-                        .iter()
-                        .find_map(|a| match a {
-                            tl::enums::DocumentAttribute::Filename(f) => Some(f.file_name.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or("Unknown".to_string());
-                    // Prefer the message caption over the built-in document filename
-                    let name = if m.message.is_empty() {
-                        doc_name.clone()
-                    } else {
-                        m.message.clone()
-                    };
-                    let size = doc.size as u64;
-                    let mime = doc.mime_type.clone();
-                    let ext = std::path::Path::new(&doc_name)
-                        .extension()
-                        .map(|os| os.to_str().unwrap_or("").to_string());
-                    let folder_id = search_source_folder(&m.peer_id, owner);
-                    files.push(FileMetadata {
-                        id: m.id as i64,
-                        folder_id,
-                        name,
-                        size,
-                        mime_type: Some(mime),
-                        file_ext: ext,
-                        created_at: search_created_at(m.date),
-                        icon_type: "file".into(),
-                        encryption_state: "plain".to_string(),
-                        is_favorite: false,
-                        is_pinned: false,
-                    });
-                }
-            }
-        }
-    }
-    files
-}
-
 #[tauri::command]
 pub async fn cmd_search_global(
     query: String,
     owner_id: Option<String>,
     app_handle: tauri::AppHandle,
-    state: State<'_, TelegramState>,
+    _state: State<'_, TelegramState>,
 ) -> Result<Vec<FileMetadata>, String> {
-    // Capture ownership before the first await, including legacy callers that
-    // omit ownerId. The client and every response must match this same session.
-    let root = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?;
-    let account = crate::workspace::AccountGuard::open(&root, owner_id.as_deref())?;
-    let client_opt = { state.client.lock().await.clone() };
-    account.validate()?;
-    #[cfg(debug_assertions)]
-    if client_opt.is_none() {
-        return Ok(Vec::new());
-    }
-    let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
-
-    let me = client.get_me().await;
-    account.validate()?;
-    let client_owner = me.map_err(map_error)?.bare_id();
-    validate_search_client(&account, client_owner)?;
-
-    let result = client
-        .invoke(&tl::functions::messages::SearchGlobal {
-            q: query,
-            filter: tl::enums::MessagesFilter::InputMessagesFilterDocument,
-            min_date: 0,
-            max_date: 0,
-            offset_rate: 0,
-            offset_peer: tl::enums::InputPeer::Empty,
-            offset_id: 0,
-            limit: 50,
-            folder_id: None,
-            broadcasts_only: false,
-            groups_only: false,
-            users_only: false,
-        })
-        .await;
-    account.validate()?;
-    let result = result.map_err(map_error)?;
-
-    let files = match result {
-        tl::enums::messages::Messages::Messages(msgs) => {
-            extract_search_files(&msgs.messages, account.owner)
-        }
-        tl::enums::messages::Messages::Slice(msgs) => {
-            extract_search_files(&msgs.messages, account.owner)
-        }
-        _ => Vec::new(),
-    };
-
-    account.validate()?;
-    Ok(files)
+    let reply = crate::commands::search::with_app(
+        app_handle,
+        owner_id.as_deref(),
+        crate::local_search::Query {
+            query,
+            limit: Some(512),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(reply.files.into_iter().map(|row| row.file).collect())
 }
 
 #[tauri::command]
 pub async fn cmd_scan_folders(
+    app: tauri::AppHandle,
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<Vec<FolderMetadata>, String> {
@@ -4326,11 +4902,20 @@ pub async fn cmd_scan_folders(
     #[cfg(debug_assertions)]
     if client_opt.is_none() {
         // If not connected, return whatever is already in the database
-        return crate::commands::folder_groups::cmd_get_enriched_folders(db_pool).await;
+        return crate::commands::folder_groups::cmd_get_enriched_folders(app, db_pool).await;
     }
     let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
 
-    let known_folder_ids = crate::db::with_connection(db_pool.inner().clone(), |connection| {
+    // The scan merges into the signed-in account's own folder list. Without
+    // this, one account's scan would prune another account's folders.
+    let account = file_mutation_account(&app, None)?;
+    account.validate_client(&client).await?;
+    let layout_scope = Some((account.root.clone(), Some(account.owner)));
+    let scope_for_known = layout_scope.clone();
+    let known_account = account.clone();
+    let known_folder_ids = crate::db::with_connection(db_pool.inner().clone(), move |connection| {
+        known_account.validate()?;
+        crate::commands::folder_groups::prepare_layout(connection, scope_for_known.as_ref())?;
         let mut statement = connection
             .prepare("SELECT channel_id FROM folder_metadata")
             .map_err(|error| error.to_string())?;
@@ -4349,79 +4934,91 @@ pub async fn cmd_scan_folders(
     let mut folders = Vec::new();
     let mut dialogs = client.iter_dialogs();
     let mut legacy_candidates = Vec::new();
-    // Serialize this complete account walk with targeted resolve_peer misses.
-    let mut peer_cache = state.peer_cache.write().await;
+    let dialog_stream = async_stream::try_stream! {
+        while let Some(dialog) = dialogs.next().await.map_err(|error| error.to_string())? {
+            yield dialog;
+        }
+    };
 
     log::info!("Starting Folder Scan...");
 
-    while let Some(dialog) = dialogs.next().await.map_err(|e| e.to_string())? {
-        // Populate peer cache for every dialog we encounter (free priming)
-        match &dialog.peer {
-            Peer::Channel(c) => {
-                let id = c.raw.id;
-                peer_cache.insert(id, dialog.peer.clone());
+    let cache_len = crate::commands::utils::scan_peer_snapshot(
+        &state.peer_cache,
+        dialog_stream,
+        |dialog| {
+            let cached_peer = match &dialog.peer {
+                Peer::Channel(channel) => Some((channel.raw.id, dialog.peer.clone())),
+                Peer::User(user) => Some((user.raw.id(), dialog.peer.clone())),
+                _ => None,
+            };
+            match &dialog.peer {
+                Peer::Channel(c) => {
+                    let id = c.raw.id;
 
-                let name = c.raw.title.clone();
-                let access_hash = c.raw.access_hash.unwrap_or(0);
+                    let name = c.raw.title.clone();
+                    let access_hash = c.raw.access_hash.unwrap_or(0);
 
-                log::debug!("[SCAN] Processing Channel: '{}' (ID: {})", name, id);
+                    log::debug!("[SCAN] Processing Channel: '{}' (ID: {})", name, id);
 
-                // Strategy 1: Title
-                if name.to_lowercase().contains("[td]") {
-                    log::info!(" -> MATCH via Title: {}", name);
-                    let display_name = name
-                        .replace(" [TD]", "")
-                        .replace(" [td]", "")
-                        .replace("[TD]", "")
-                        .replace("[td]", "")
-                        .trim()
-                        .to_string();
-                    let username = c.raw.username.clone();
-                    let is_public = username.is_some();
-                    folders.push(FolderMetadata {
-                        id,
-                        name: display_name,
-                        parent_id: None,
-                        username,
-                        is_public,
-                        group_id: None,
-                        display_order: 0,
-                    });
-                    continue;
+                    // Strategy 1: Title
+                    if name.to_lowercase().contains("[td]") {
+                        log::info!(" -> MATCH via Title: {}", name);
+                        let display_name = name
+                            .replace(" [TD]", "")
+                            .replace(" [td]", "")
+                            .replace("[TD]", "")
+                            .replace("[td]", "")
+                            .trim()
+                            .to_string();
+                        let username = c.raw.username.clone();
+                        let is_public = username.is_some();
+                        folders.push(FolderMetadata {
+                            id,
+                            name: display_name,
+                            parent_id: None,
+                            username,
+                            is_public,
+                            group_id: None,
+                            display_order: 0,
+                        });
+                        return cached_peer;
+                    }
+
+                    // A channel already verified and persisted by a previous scan
+                    // does not need another GetFullChannel network round trip just
+                    // because it uses the legacy About marker.
+                    if known_folder_ids.contains(&id) {
+                        let username = c.raw.username.clone();
+                        folders.push(FolderMetadata {
+                            id,
+                            name,
+                            parent_id: None,
+                            is_public: username.is_some(),
+                            username,
+                            group_id: None,
+                            display_order: 0,
+                        });
+                        return cached_peer;
+                    }
+
+                    // Strategy 2: About. Unknown legacy candidates are checked in
+                    // a small bounded batch after dialog enumeration.
+                    if c.raw.creator {
+                        legacy_candidates.push((id, access_hash, name, c.raw.username.clone()));
+                    }
                 }
-
-                // A channel already verified and persisted by a previous scan
-                // does not need another GetFullChannel network round trip just
-                // because it uses the legacy About marker.
-                if known_folder_ids.contains(&id) {
-                    let username = c.raw.username.clone();
-                    folders.push(FolderMetadata {
-                        id,
-                        name,
-                        parent_id: None,
-                        is_public: username.is_some(),
-                        username,
-                        group_id: None,
-                        display_order: 0,
-                    });
-                    continue;
+                Peer::User(u) => {
+                    log::debug!("[SCAN] Cached User Peer: {}", u.raw.id());
                 }
-
-                // Strategy 2: About. Unknown legacy candidates are checked in
-                // a small bounded batch after dialog enumeration.
-                if c.raw.creator {
-                    legacy_candidates.push((id, access_hash, name, c.raw.username.clone()));
+                peer => {
+                    log::debug!("[SCAN] Skipped Peer: {:?}", peer);
                 }
             }
-            Peer::User(u) => {
-                peer_cache.insert(u.raw.id(), dialog.peer.clone());
-                log::debug!("[SCAN] Cached User Peer: {}", u.raw.id());
-            }
-            peer => {
-                log::debug!("[SCAN] Skipped Peer: {:?}", peer);
-            }
-        }
-    }
+            cached_peer
+        },
+        &account,
+    )
+    .await?;
 
     use futures::stream::{self, StreamExt};
     let legacy_results = stream::iter(legacy_candidates.into_iter().map(
@@ -4470,8 +5067,6 @@ pub async fn cmd_scan_folders(
     .await;
     folders.extend(legacy_results.into_iter().flatten());
 
-    let cache_len = peer_cache.len();
-    drop(peer_cache);
     log::info!(
         "Scan complete. Found {} folders. Peer cache size: {}. Elapsed: {:?}.",
         folders.len(),
@@ -4479,11 +5074,15 @@ pub async fn cmd_scan_folders(
         scan_started_at.elapsed()
     );
 
+    let catalog_account = account.clone();
     // Enrich folders via the local DB
     let enriched = crate::db::with_connection(db_pool.inner().clone(), move |conn| {
+        account.validate()?;
+        crate::commands::folder_groups::prepare_layout(conn, layout_scope.as_ref())?;
         crate::commands::folder_groups::get_enriched_folders_internal(conn, folders)
     })
     .await?;
+    crate::commands::search::verified_catalog(&catalog_account, &enriched)?;
     Ok(enriched)
 }
 
@@ -4724,20 +5323,18 @@ pub async fn cmd_toggle_folder_visibility(
     let client_opt = { state.client.lock().await.clone() };
 
     let mut folder = if client_opt.is_none() {
-        log::info!(
-            "[MOCK] Toggle visibility for folder {}. Public: {}",
-            folder_id,
-            make_public
-        );
-        FolderMetadata {
-            id: folder_id,
-            name: "Mock Folder".to_string(),
-            parent_id: None,
-            username: if make_public { desired_username } else { None },
-            is_public: make_public,
-            group_id: None,
-            display_order: 0,
-        }
+        disconnected_folder_stand_in(
+            "Changed visibility of",
+            FolderMetadata {
+                id: folder_id,
+                name: "Mock Folder".to_string(),
+                parent_id: None,
+                username: if make_public { desired_username } else { None },
+                is_public: make_public,
+                group_id: None,
+                display_order: 0,
+            },
+        )?
     } else {
         let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
 
@@ -5197,6 +5794,7 @@ pub async fn cmd_upload_from_url(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
@@ -5216,6 +5814,7 @@ pub async fn cmd_upload_from_url(
             prompt_token,
             protect_metadata,
             video_upload_mode,
+            video_filename_caption,
             app_handle,
             state,
             bw_state,
@@ -5237,6 +5836,7 @@ async fn cmd_upload_from_url_owned(
     prompt_token: Option<u64>,
     protect_metadata: Option<bool>,
     video_upload_mode: Option<String>,
+    video_filename_caption: Option<bool>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, Arc<BandwidthManager>>,
@@ -5300,7 +5900,8 @@ async fn cmd_upload_from_url_owned(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
-    let temp_dir = std::env::temp_dir();
+    let temp_dir = crate::temp_artifacts::staging_root()
+        .map_err(|error| format!("Could not prepare private staging storage: {error}"))?;
 
     if let Some(sz) = known_size {
         if sz > MAX_REMOTE_UPLOAD_BYTES {
@@ -5323,12 +5924,12 @@ async fn cmd_upload_from_url_owned(
         if free_space < sz + 52_428_800 {
             return Err("Insufficient disk space in temp directory.".to_string());
         }
-        bw_state.try_reserve_down(sz)?;
-        if let Err(e) = bw_state.try_reserve_up(sz) {
-            bw_state.release_down(sz);
-            return Err(e);
-        }
     }
+
+    let mut download_reservation =
+        BandwidthReservation::download(bw_state.inner().clone(), known_size.unwrap_or(0))?;
+    let mut upload_reservation =
+        BandwidthReservation::upload(bw_state.inner().clone(), known_size.unwrap_or(0))?;
 
     let display_total = known_size.unwrap_or(0); // 0 = unknown size to frontend
     let _ = app_handle.emit(
@@ -5345,6 +5946,7 @@ async fn cmd_upload_from_url_owned(
 
     let temp_file_path = temp_dir.join(format!("tg_drive_{}.tmp", transfer_id));
     let temp_file_str = temp_file_path.to_string_lossy().to_string();
+    let _downloaded_temp_guard = PartialFileGuard::new(temp_file_path.clone());
 
     let mut downloaded = 0u64;
     let mut range_supported = false;
@@ -5379,10 +5981,6 @@ async fn cmd_upload_from_url_owned(
         match validated_remote_get(final_url.clone(), Some(downloaded), &net_config).await {
             Ok((_resolved_url, response)) => response,
             Err(e) => {
-                if let Some(sz) = known_size {
-                    bw_state.release_down(sz);
-                    bw_state.release_up(sz);
-                }
                 return Err(e);
             }
         }
@@ -5401,10 +5999,6 @@ async fn cmd_upload_from_url_owned(
             {
                 Ok(f) => f,
                 Err(e) => {
-                    if let Some(sz) = known_size {
-                        bw_state.release_down(sz);
-                        bw_state.release_up(sz);
-                    }
                     return Err(e.to_string());
                 }
             }
@@ -5413,10 +6007,6 @@ async fn cmd_upload_from_url_owned(
             match tokio::fs::File::create(&temp_file_path).await {
                 Ok(f) => f,
                 Err(e) => {
-                    if let Some(sz) = known_size {
-                        bw_state.release_down(sz);
-                        bw_state.release_up(sz);
-                    }
                     return Err(e.to_string());
                 }
             }
@@ -5429,10 +6019,6 @@ async fn cmd_upload_from_url_owned(
         {
             Ok(f) => f,
             Err(e) => {
-                if let Some(sz) = known_size {
-                    bw_state.release_down(sz);
-                    bw_state.release_up(sz);
-                }
                 return Err(e.to_string());
             }
         }
@@ -5440,10 +6026,6 @@ async fn cmd_upload_from_url_owned(
         match tokio::fs::File::create(&temp_file_path).await {
             Ok(f) => f,
             Err(e) => {
-                if let Some(sz) = known_size {
-                    bw_state.release_down(sz);
-                    bw_state.release_up(sz);
-                }
                 return Err(e.to_string());
             }
         }
@@ -5458,10 +6040,6 @@ async fn cmd_upload_from_url_owned(
         {
             drop(file);
             let _ = tokio::fs::remove_file(&temp_file_path).await;
-            if let Some(size) = known_size {
-                bw_state.release_down(size);
-                bw_state.release_up(size);
-            }
             return Err(format!(
                 "Failed to protect remote-upload temporary file: {}",
                 error
@@ -5484,29 +6062,39 @@ async fn cmd_upload_from_url_owned(
                 state.cancelled_transfers.write().await.remove(&transfer_id);
                 drop(file);
                 let _ = tokio::fs::remove_file(&temp_file_path).await;
-                if let Some(sz) = known_size {
-                    bw_state.release_down(sz);
-                    bw_state.release_up(sz);
-                }
                 return Err("Transfer cancelled".to_string());
             }
 
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
-                    if let Some(sz) = known_size {
-                        bw_state.release_down(sz);
-                        bw_state.release_up(sz);
-                    }
                     return Err(e.to_string());
                 }
             };
 
+            pace_download(
+                &net_config,
+                &transfer_account,
+                &state,
+                &transfer_id,
+                chunk.len(),
+            )
+            .await?;
+            let next_size = downloaded
+                .checked_add(chunk.len() as u64)
+                .ok_or("Remote file size overflowed")?;
+            if next_size > MAX_REMOTE_UPLOAD_BYTES
+                || known_size.is_some_and(|size| next_size > size)
+            {
+                return Err(
+                    "Downloaded file exceeds its declared size or 2GB Telegram limit".into(),
+                );
+            }
+            if known_size.is_none() {
+                download_reservation.resize(next_size)?;
+                upload_reservation.resize(next_size)?;
+            }
             if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
-                if let Some(sz) = known_size {
-                    bw_state.release_down(sz);
-                    bw_state.release_up(sz);
-                }
                 return Err(e.to_string());
             }
             downloaded += chunk.len() as u64;
@@ -5552,46 +6140,17 @@ async fn cmd_upload_from_url_owned(
                 last_emit_time = now;
                 last_emit_bytes = downloaded;
             }
-
-            let dl_limit = net_config.download_limit_bytes_per_sec();
-            if dl_limit > 0 {
-                let elapsed = last_emit_time.elapsed().as_secs_f64().max(0.001);
-                let current_rate = (downloaded - last_emit_bytes) as f64 / elapsed;
-                if current_rate > dl_limit as f64 {
-                    let sleep_ms =
-                        ((current_rate / dl_limit as f64 - 1.0) * elapsed * 1000.0) as u64;
-                    if sleep_ms > 0 && sleep_ms < 5000 {
-                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                    }
-                }
-            }
         }
 
         if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut file).await {
-            if let Some(sz) = known_size {
-                bw_state.release_down(sz);
-                bw_state.release_up(sz);
-            }
             return Err(e.to_string());
         }
         if let Err(e) = file.sync_all().await {
-            if let Some(sz) = known_size {
-                bw_state.release_down(sz);
-                bw_state.release_up(sz);
-            }
             return Err(e.to_string());
         }
     }
 
     drop(file);
-    if let Some(sz) = known_size {
-        bw_state.release_down(sz);
-        // Release the upfront upload reservation — we'll re-reserve based on actual size below
-        bw_state.release_up(sz);
-    }
-
-    // Keep cleanup active across account-switch failures and publication errors.
-    let _downloaded_temp_guard = PartialFileGuard::new(temp_file_path.clone());
 
     // Determine actual file size from disk (authoritative, works even without Content-Length)
     let actual_size = tokio::fs::metadata(&temp_file_path)
@@ -5608,6 +6167,12 @@ async fn cmd_upload_from_url_owned(
         let _ = tokio::fs::remove_file(&temp_file_path).await;
         return Err("Downloaded file exceeds 2GB Telegram limit.".to_string());
     }
+
+    if known_size.is_some_and(|size| size != actual_size) {
+        return Err("Downloaded file did not match its declared size".into());
+    }
+    download_reservation.resize(actual_size)?;
+    upload_reservation.resize(actual_size)?;
 
     // Remote uploads must preserve the same protection intent as every other
     // upload origin. Stage the downloaded file under its logical server name so
@@ -5671,6 +6236,9 @@ async fn cmd_upload_from_url_owned(
             prompt_token,
             protect_metadata,
             video_upload_mode,
+            video_filename_caption,
+            None,
+            Some(upload_reservation),
             app_handle,
             state,
             bw_state,
@@ -5681,6 +6249,9 @@ async fn cmd_upload_from_url_owned(
         .await;
         let _ = tokio::fs::remove_file(&staged_path).await;
         let _ = tokio::fs::remove_dir(&staged_dir).await;
+        if result.is_ok() {
+            download_reservation.commit();
+        }
         return result;
     }
 
@@ -5695,23 +6266,40 @@ async fn cmd_upload_from_url_owned(
             })
             .unwrap_or_else(|| "remote_file".to_string())
     });
-    let video_metadata = match prepare_video_upload_metadata(
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let (_cancellation, mut cancel_rx) = UploadCancellation::register(&transfer_id);
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if state
+        .cancelled_transfers
+        .read()
+        .await
+        .contains(&transfer_id)
+    {
+        let _ = tokio::fs::remove_file(&temp_file_path).await;
+        return Err("Transfer cancelled".into());
+    }
+    let video_caption = video_filename_caption_text(&file_name, video_filename_caption);
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let preparation = prepare_video_upload_metadata(
         &temp_file_str,
         &file_name,
         parsed_video_upload,
+        &transfer_account,
+        &mut cancel_rx,
+        app_handle.path().resource_dir().ok(),
+        bw_state.inner().clone(),
     )
-    .await
-    {
+    .await;
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let preparation =
+        prepare_video_upload_metadata(&temp_file_str, &file_name, parsed_video_upload).await;
+    let video_metadata = match preparation {
         Ok(metadata) => metadata,
         Err(error) => {
             let _ = tokio::fs::remove_file(&temp_file_path).await;
             return Err(error);
         }
     };
-
-    // Reserve upload bandwidth based on the real file size (handles both known and unknown upfront)
-    let mut upload_reservation =
-        BandwidthReservation::upload(bw_state.inner().clone(), actual_size)?;
 
     let client_opt = { state.client.lock().await.clone() };
     let client = match client_opt {
@@ -5802,13 +6390,23 @@ async fn cmd_upload_from_url_owned(
         return Err("Transfer cancelled".to_string());
     }
 
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     get_upload_cancellations()
         .lock()
         .unwrap()
         .insert(transfer_id.clone(), cancel_tx);
 
     let client_clone = client.clone();
+    let mut reader = crate::traffic::Reader::new(
+        reader,
+        crate::traffic::Traffic {
+            network: net_config.inner().clone(),
+            account: transfer_account.clone(),
+            direction: crate::traffic::Direction::Upload,
+        },
+    );
     let mut upload_task = tokio::spawn(async move {
         client_clone
             .upload_stream(&mut reader, file_size as usize, file_name)
@@ -5818,6 +6416,7 @@ async fn cmd_upload_from_url_owned(
     let uploaded_file = {
         tokio::select! {
             res = &mut upload_task => {
+                #[cfg(any(target_os = "android", target_os = "ios"))]
                 get_upload_cancellations().lock().unwrap().remove(&transfer_id);
                 match res {
                     Ok(Ok(file)) => file,
@@ -5833,7 +6432,7 @@ async fn cmd_upload_from_url_owned(
                     }
                 }
             }
-            _ = cancel_rx => {
+            _ = &mut cancel_rx => {
                 log::info!("Aborting remote upload task for transfer ID: {}", transfer_id);
                 upload_task.abort();
                 state.cancelled_transfers.write().await.remove(&transfer_id);
@@ -5846,9 +6445,12 @@ async fn cmd_upload_from_url_owned(
 
     progress_task.abort();
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let message = InputMessage::new().text("").file(uploaded_file.clone());
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     let message = match video_metadata {
         Some(video) => InputMessage::new()
-            .text("")
+            .text(video_caption)
             .mime_type(video.mime_type)
             .document(uploaded_file)
             .attribute(Attribute::Video {
@@ -5878,13 +6480,49 @@ async fn cmd_upload_from_url_owned(
 
     for attempt in 0..=max_retries {
         transfer_account.validate()?;
-        match client.send_message(&peer, message.clone()).await {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let publication = if let Some(video) = video_metadata.as_ref() {
+            crate::desktop_video_upload::publish(
+                video,
+                uploaded_file.clone(),
+                video_caption.clone(),
+                &crate::desktop_video_upload::TelegramTransport {
+                    client: &client,
+                    peer: &peer,
+                },
+                &transfer_account,
+                bw_state.inner().clone(),
+                net_config.inner().clone(),
+                &mut cancel_rx,
+            )
+            .await
+        } else {
+            client
+                .send_message(&peer, message.clone())
+                .await
+                .map_err(map_error)
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let publication = client
+            .send_message(&peer, message.clone())
+            .await
+            .map_err(map_error);
+        match publication {
             Ok(_) => {
+                crate::file_inventory::changed(&transfer_account, folder_id, &[])?;
                 send_success = true;
                 break;
             }
             Err(e) => {
-                let err = map_error(e);
+                let err = e;
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                if err == "Transfer cancelled"
+                    || err.starts_with("ACCOUNT_CHANGED")
+                    || err.starts_with("[VIDEO_SOURCE_CHANGED]")
+                {
+                    let _ = tokio::fs::remove_file(&temp_file_path).await;
+                    return Err(err);
+                }
                 log::warn!(
                     "send_message attempt {}/{}: {}",
                     attempt + 1,
@@ -5914,6 +6552,7 @@ async fn cmd_upload_from_url_owned(
 
     if send_success {
         upload_reservation.commit();
+        download_reservation.commit();
         let _ = app_handle.emit(
             "remote-upload-progress",
             RemoteProgressPayload {
@@ -5934,130 +6573,3 @@ async fn cmd_upload_from_url_owned(
         ))
     }
 }
-
-#[cfg(test)]
-mod hardening_tests {
-    use super::*;
-
-    #[test]
-    fn moves_require_every_forwarded_copy_before_source_deletion() {
-        assert!(verify_forwarded_messages(&[1, 2], &[Some(11), Some(12)]).is_ok());
-        assert!(verify_forwarded_messages(&[1, 2], &[Some(11), None]).is_err());
-        assert!(verify_forwarded_messages(&[1, 2], &[Some(11)]).is_err());
-        assert!(verify_forwarded_messages(&[1], &[Some(11), Some(12)]).is_err());
-        assert!(verify_forwarded_messages::<i32>(&[1], &[None]).is_err());
-    }
-
-    #[test]
-    fn global_search_dates_are_rfc3339_at_unix_and_telegram_boundaries() {
-        assert_eq!(search_created_at(0), "1970-01-01T00:00:00+00:00");
-        for timestamp in [i32::MIN, 1_700_000_000, i32::MAX] {
-            let parsed =
-                chrono::DateTime::parse_from_rfc3339(&search_created_at(timestamp)).unwrap();
-            assert_eq!(parsed.timestamp(), i64::from(timestamp));
-        }
-    }
-
-    #[test]
-    fn video_upload_mode_is_explicit_and_file_is_the_compatible_default() {
-        assert_eq!(VideoUploadMode::parse(None).unwrap(), VideoUploadMode::File);
-        assert_eq!(
-            VideoUploadMode::parse(Some("media")).unwrap(),
-            VideoUploadMode::Media
-        );
-        assert!(VideoUploadMode::parse(Some("automatic")).is_err());
-        assert!(is_mp4_family_video("clip.MP4"));
-        assert!(is_mp4_family_video("clip.mov"));
-        assert!(!is_mp4_family_video("clip.mkv"));
-    }
-
-    #[test]
-    fn remote_upload_blocks_local_and_reserved_addresses() {
-        for address in [
-            "127.0.0.1",
-            "10.0.0.1",
-            "172.16.0.1",
-            "192.168.1.1",
-            "169.254.169.254",
-            "100.64.0.1",
-            "192.0.2.1",
-            "198.51.100.1",
-            "203.0.113.1",
-            "::1",
-            "fc00::1",
-            "fe80::1",
-            "2001:db8::1",
-        ] {
-            let address = address.parse().unwrap();
-            assert!(!is_public_remote_ip(address), "{address} must be blocked");
-        }
-        assert!(is_public_remote_ip("8.8.8.8".parse().unwrap()));
-        assert!(is_public_remote_ip("2606:4700:4700::1111".parse().unwrap()));
-    }
-
-    #[test]
-    fn remote_upload_accepts_only_public_http_urls_without_embedded_credentials() {
-        for blocked in [
-            "file:///etc/passwd",
-            "http://localhost/file",
-            "http://service.local/file",
-            "http://169.254.169.254/latest/meta-data",
-            "https://user:password@example.com/file",
-        ] {
-            let url = reqwest::Url::parse(blocked).unwrap();
-            assert!(
-                validate_remote_url_syntax(&url).is_err(),
-                "{blocked} must be blocked"
-            );
-        }
-        assert!(validate_remote_url_syntax(
-            &reqwest::Url::parse("https://example.com/file.zip").unwrap()
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn redirect_validation_blocks_private_targets() {
-        let current = reqwest::Url::parse("https://example.com/file").unwrap();
-        assert!(redirect_target(&current, "http://127.0.0.1/private").is_err());
-        assert!(redirect_target(&current, "https://cdn.example.com/file").is_ok());
-    }
-
-    #[test]
-    fn zip_cleanup_layout_accepts_only_uuid_scoped_zip_files() {
-        let root = std::path::Path::new("/app-cache/transfer-zips");
-        let id = uuid::Uuid::new_v4();
-        assert!(is_owned_zip_artifact(
-            root,
-            &root.join(id.to_string()).join("folder.zip")
-        ));
-        assert!(!is_owned_zip_artifact(root, &root.join("other.txt")));
-        assert!(!is_owned_zip_artifact(
-            root,
-            &root.join("not-a-uuid").join("folder.zip")
-        ));
-    }
-
-    #[test]
-    fn atomic_download_publish_replaces_destination_only_when_source_exists() {
-        let directory = std::env::temp_dir().join(format!(
-            "telegram-drive-publish-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let destination = directory.join("result.bin");
-        let source = directory.join("result.part");
-        std::fs::write(&destination, b"old").unwrap();
-        assert!(replace_download_file(&directory.join("missing"), &destination).is_err());
-        assert_eq!(std::fs::read(&destination).unwrap(), b"old");
-        std::fs::write(&source, b"new").unwrap();
-        replace_download_file(&source, &destination).unwrap();
-        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
-        let _ = std::fs::remove_file(&destination);
-        let _ = std::fs::remove_dir(&directory);
-    }
-}
-
-#[cfg(test)]
-#[path = "search_scope_tests.rs"]
-mod search_scope_tests;

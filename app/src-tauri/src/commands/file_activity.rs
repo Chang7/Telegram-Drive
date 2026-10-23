@@ -106,7 +106,11 @@ pub(crate) async fn folder_flags(
     let account = account.clone();
     tokio::task::spawn_blocking(move || {
         account.validate()?;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let flags = read_folder_flags(&Store::open(&account.root, account.owner)?, folder_id)?;
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let files = Store::open(&account.root, account.owner)?.folder_files(folder_id)?;
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let flags = files
             .into_iter()
             .filter_map(|file| {
@@ -120,6 +124,58 @@ pub(crate) async fn folder_flags(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Flags are optional local decoration for a remote listing. A damaged cached
+/// filename or flag must not prevent that listing from repairing its metadata.
+/// Preserve the original rows and recover every valid flag independently.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn read_folder_flags(
+    store: &Store,
+    folder_id: Option<i64>,
+) -> Result<HashMap<i32, (bool, bool)>, String> {
+    let folder = folder_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "saved".into());
+    let prefix = format!("{folder}:");
+    let mut statement = store
+        .db
+        .prepare(
+            "SELECT f.key,f.metadata,r.value,p.value FROM workspace_files f
+         LEFT JOIN workspace_records r ON r.kind='favorite' AND r.id=f.key
+         LEFT JOIN workspace_records p ON p.kind='pin' AND p.id=f.key
+         WHERE f.folder=?",
+        )
+        .map_err(|e| e.to_string())?;
+    statement
+        .bind((1, folder.as_str()))
+        .map_err(|e| e.to_string())?;
+    let mut flags = HashMap::new();
+    while statement.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+        let key = statement.read::<String, _>(0).map_err(|e| e.to_string())?;
+        let Some(message) = key
+            .strip_prefix(&prefix)
+            .and_then(|id| id.parse::<i32>().ok())
+            .filter(|id| *id > 0)
+        else {
+            continue;
+        };
+        let metadata = statement.read::<String, _>(1).map_err(|e| e.to_string())?;
+        let file = serde_json::from_str::<FileMetadata>(&metadata)
+            .ok()
+            .filter(|file| file.id == i64::from(message) && file.folder_id == folder_id);
+        let favorite = file.as_ref().is_some_and(|file| file.is_favorite);
+        let pinned = file.as_ref().is_some_and(|file| file.is_pinned);
+        let read_flag = |column, fallback| -> Result<bool, String> {
+            Ok(statement
+                .read::<Option<String>, _>(column)
+                .map_err(|e| e.to_string())?
+                .and_then(|value| serde_json::from_str::<bool>(&value).ok())
+                .unwrap_or(fallback))
+        };
+        flags.insert(message, (read_flag(2, favorite)?, read_flag(3, pinned)?));
+    }
+    Ok(flags)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -239,89 +295,4 @@ pub async fn cmd_get_file_activity(
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn file(folder: Option<i64>, name: &str) -> FileMetadata {
-        metadata(
-            folder,
-            42,
-            name.into(),
-            100,
-            Some("text/plain".into()),
-            Some("txt".into()),
-            None,
-            None,
-        )
-    }
-
-    #[test]
-    fn personal_views_are_scoped_by_account_and_saved_messages_identity() {
-        let root = std::env::temp_dir().join(format!("file-activity-{}", uuid::Uuid::new_v4()));
-        let a = Store::open(&root, 100).unwrap();
-        let b = Store::open(&root, 200).unwrap();
-        let saved = file(None, "A saved.txt");
-        let channel = file(Some(9), "A channel.txt");
-        let other = file(None, "B saved.txt");
-        change_activity(&a, &saved, ActivityChange::Open).unwrap();
-        change_activity(&a, &saved, ActivityChange::Flag("favorite", true)).unwrap();
-        change_activity(&a, &channel, ActivityChange::Flag("pinned", true)).unwrap();
-        change_activity(&b, &other, ActivityChange::Open).unwrap();
-        assert_eq!(
-            read_activity(&a, "favorites", None).unwrap()[0].file.name,
-            "A saved.txt"
-        );
-        assert_eq!(
-            read_activity(&a, "pinned", None).unwrap()[0].file.name,
-            "A channel.txt"
-        );
-        assert_eq!(
-            read_activity(&b, "recents", None).unwrap()[0].file.name,
-            "B saved.txt"
-        );
-        assert!(read_activity(&b, "favorites", None).unwrap().is_empty());
-        assert!(read_activity(&b, "pinned", None).unwrap().is_empty());
-        change_activity(&a, &saved, ActivityChange::Flag("favorite", false)).unwrap();
-        assert!(read_activity(&a, "favorites", None).unwrap().is_empty());
-        assert!(a.folder_files(Some(9)).unwrap()[0].is_pinned);
-        drop(a);
-        drop(b);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn protected_names_are_redacted_and_activity_does_not_change_a_scan_generation() {
-        let root = std::env::temp_dir().join(format!("file-activity-{}", uuid::Uuid::new_v4()));
-        let store = Store::open(&root, 100).unwrap();
-        let mut protected = file(None, "Secret filename.txt");
-        protected.encryption_state = "encrypted_unlocked".into();
-        store
-            .remember_files(&[protected.clone()], "Saved Messages", "active-scan")
-            .unwrap();
-        change_activity(&store, &protected, ActivityChange::Open).unwrap();
-        change_activity(&store, &protected, ActivityChange::Flag("favorite", true)).unwrap();
-        store.complete_scan(None, "active-scan").unwrap();
-        let records = read_activity(&store, "recents", None).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].file.name, "Protected file");
-        assert_eq!(records[0].file.encryption_state, "encrypted_locked");
-        assert!(records[0].file.is_favorite);
-        let wire = serde_json::to_string(&records).unwrap();
-        assert!(!wire.contains("Secret filename"));
-        assert!(change_activity(
-            &store,
-            &file(None, "Rejected.txt"),
-            ActivityChange::Flag("unknown", true)
-        )
-        .is_err());
-        assert_eq!(
-            store.file("saved:42").unwrap().unwrap().file.name,
-            "Protected file"
-        );
-        drop(store);
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }

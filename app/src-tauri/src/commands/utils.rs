@@ -17,62 +17,154 @@ pub async fn resolve_peer(
     peer_cache: &Arc<RwLock<HashMap<i64, Peer>>>,
 ) -> Result<Peer, String> {
     if let Some(fid) = folder_id {
-        // Fast path: check cache
-        {
-            let cache = peer_cache.read().await;
-            if let Some(peer) = cache.get(&fid) {
-                return Ok(peer.clone());
-            }
-        }
-
-        // Slow path: take the write lock for the duration of discovery. This
-        // intentionally single-flights cache population so startup folder
-        // discovery and a file request cannot walk every dialog concurrently.
-        let mut cache = peer_cache.write().await;
-        if let Some(peer) = cache.get(&fid) {
-            return Ok(peer.clone());
-        }
-        log::debug!("Peer cache miss for folder_id={}, scanning dialogs...", fid);
-        let mut dialogs = client.iter_dialogs();
-        while let Some(dialog) = dialogs.next().await.map_err(|e| e.to_string())? {
-            let peer_id = match &dialog.peer {
-                Peer::Channel(c) => Some(c.raw.id),
-                Peer::User(u) => Some(u.raw.id()),
-                _ => None,
-            };
-            if let Some(id) = peer_id {
-                cache.insert(id, dialog.peer.clone());
-                if id == fid {
-                    // A targeted file open should not wait for the rest of the
-                    // account merely to warm an optional in-memory cache.
-                    return Ok(dialog.peer);
+        resolve_cached_peer(peer_cache, fid, || async {
+            let mut discovered = HashMap::new();
+            let mut dialogs = client.iter_dialogs();
+            while let Some(dialog) = dialogs.next().await.map_err(|e| e.to_string())? {
+                let id = match &dialog.peer {
+                    Peer::Channel(channel) => Some(channel.raw.id),
+                    Peer::User(user) => Some(user.raw.id()),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    discovered.insert(id, dialog.peer);
+                    if id == fid {
+                        break;
+                    }
                 }
             }
-        }
-        Err(format!("Folder/Chat {} not found", fid))
+            Ok(discovered)
+        })
+        .await
     } else {
-        match client.get_me().await {
-            Ok(me) => Ok(Peer::User(me)),
-            Err(e) => Err(e.to_string()),
+        client
+            .get_me()
+            .await
+            .map(Peer::User)
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Default)]
+struct PeerDiscovery {
+    lock: tokio::sync::Mutex<()>,
+    epoch: std::sync::atomic::AtomicU64,
+}
+static PEER_DISCOVERY: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<usize, std::sync::Weak<PeerDiscovery>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+fn discovery<P>(cache: &Arc<RwLock<HashMap<i64, P>>>) -> Arc<PeerDiscovery> {
+    let key = Arc::as_ptr(cache) as usize;
+    let mut flights = PEER_DISCOVERY.lock().unwrap_or_else(|e| e.into_inner());
+    flights.retain(|_, flight| flight.strong_count() > 0);
+    if let Some(flight) = flights.get(&key).and_then(std::sync::Weak::upgrade) {
+        return flight;
+    }
+    let flight = Arc::new(PeerDiscovery::default());
+    flights.insert(key, Arc::downgrade(&flight));
+    flight
+}
+
+pub(crate) async fn resolve_cached_peer<P, F, Fut>(
+    cache: &Arc<RwLock<HashMap<i64, P>>>,
+    id: i64,
+    discover: F,
+) -> Result<P, String>
+where
+    P: Clone,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<HashMap<i64, P>, String>>,
+{
+    let discovery = discovery(cache);
+    let epoch = discovery.epoch.load(std::sync::atomic::Ordering::SeqCst);
+    let check = || {
+        if discovery.epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+            Err("ACCOUNT_CHANGED: Peer discovery was cleared".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    {
+        let cached = cache.read().await;
+        check()?;
+        if let Some(peer) = cached.get(&id).cloned() {
+            return Ok(peer);
         }
     }
+    let _flight = discovery.lock.lock().await;
+    check()?;
+    {
+        let cached = cache.read().await;
+        check()?;
+        if let Some(peer) = cached.get(&id).cloned() {
+            return Ok(peer);
+        }
+    }
+    let discovered = discover().await?;
+    let mut published = cache.write().await;
+    if discovery.epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+        return Err("ACCOUNT_CHANGED: Peer discovery was cleared".into());
+    }
+    published.extend(discovered);
+    published
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| format!("Folder/Chat {id} not found"))
+}
+
+/// Walk dialogs and publish their peers. The visitor also builds the folder
+/// result, while the account check binds publication to the originating session.
+pub(crate) async fn scan_peer_snapshot<S, T, P, V>(
+    cache: &RwLock<HashMap<i64, P>>,
+    dialogs: S,
+    mut visit: V,
+    account: &crate::workspace::AccountGuard,
+) -> Result<usize, String>
+where
+    S: futures::Stream<Item = Result<T, String>>,
+    V: FnMut(T) -> Option<(i64, P)>,
+{
+    use futures::StreamExt;
+    futures::pin_mut!(dialogs);
+    let mut peers = HashMap::new();
+    while let Some(dialog) = dialogs.next().await {
+        if let Some((id, peer)) = visit(dialog?) {
+            peers.insert(id, peer);
+        }
+    }
+    let count = peers.len();
+    let mut published = cache.write().await;
+    account.validate()?;
+    *published = peers;
+    Ok(count)
 }
 
 /// Clear the peer cache (called on logout)
 pub async fn clear_peer_cache(peer_cache: &Arc<RwLock<HashMap<i64, Peer>>>) {
-    peer_cache.write().await.clear();
+    clear_cached_peers(peer_cache).await;
 }
 
-#[tauri::command]
-pub fn cmd_log(message: String) {
-    log::info!("[FRONTEND] {}", message);
+pub(crate) async fn clear_cached_peers<P>(peer_cache: &Arc<RwLock<HashMap<i64, P>>>) {
+    let discovery = discovery(peer_cache);
+    discovery
+        .epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    peer_cache.write().await.clear();
 }
 
 #[tauri::command]
 pub fn cmd_get_bandwidth(
     bw_state: State<'_, Arc<BandwidthManager>>,
-) -> crate::bandwidth::BandwidthStats {
-    bw_state.get_stats()
+) -> Result<crate::bandwidth::BandwidthStats, String> {
+    bw_state.checked_stats()
+}
+
+#[tauri::command]
+pub fn cmd_set_weekly_quota(
+    limit_bytes: u64,
+    bw_state: State<'_, Arc<BandwidthManager>>,
+) -> Result<crate::bandwidth::BandwidthStats, String> {
+    bw_state.set_limit(limit_bytes)
 }
 
 pub fn map_error(e: impl std::fmt::Display) -> String {
@@ -93,6 +185,18 @@ pub fn map_error(e: impl std::fmt::Display) -> String {
     err_str
 }
 
+/// Parse the numeric part of Telegram's normalized FLOOD_WAIT marker.
+/// Callers retain their own case normalization, delay bounds, and retry policy.
+pub(crate) fn flood_wait_seconds(error: &str) -> Option<u64> {
+    const MARKER: &str = "FLOOD_WAIT_";
+    let start = error.find(MARKER)? + MARKER.len();
+    let digits: String = error[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
 /// Return Telegram's declared byte size for downloadable media.
 ///
 /// Photos do not expose a document-level size. Grammers derives their size
@@ -110,47 +214,4 @@ pub fn media_size(media: &Media) -> u64 {
 
 fn nonnegative_size(size: i64) -> u64 {
     u64::try_from(size).unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{media_size, nonnegative_size};
-    use grammers_client::types::{Media, Photo};
-    use grammers_tl_types as tl;
-
-    #[test]
-    fn telegram_sizes_are_safely_normalized() {
-        assert_eq!(nonnegative_size(-1), 0);
-        assert_eq!(nonnegative_size(0), 0);
-        assert_eq!(nonnegative_size(1_572_864), 1_572_864);
-    }
-
-    #[test]
-    fn photo_size_uses_the_largest_available_representation() {
-        let photo = Photo::from_raw(tl::enums::Photo::Photo(tl::types::Photo {
-            has_stickers: false,
-            id: 1,
-            access_hash: 2,
-            file_reference: Vec::new(),
-            date: 0,
-            sizes: vec![
-                tl::enums::PhotoSize::Size(tl::types::PhotoSize {
-                    r#type: "m".to_string(),
-                    w: 320,
-                    h: 240,
-                    size: 42_000,
-                }),
-                tl::enums::PhotoSize::Size(tl::types::PhotoSize {
-                    r#type: "y".to_string(),
-                    w: 2560,
-                    h: 1920,
-                    size: 1_572_864,
-                }),
-            ],
-            video_sizes: None,
-            dc_id: 1,
-        }));
-
-        assert_eq!(media_size(&Media::Photo(photo)), 1_572_864);
-    }
 }

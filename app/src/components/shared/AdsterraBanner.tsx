@@ -9,6 +9,7 @@ import {
   sponsorAdCooldownRemaining,
 } from '../../services/supporterVisibility';
 import i18n from '../../i18n';
+import { useTranslation } from 'react-i18next';
 
 interface AdsterraBannerProps {
   visible: boolean;
@@ -21,6 +22,7 @@ const LEGACY_DISMISSED_KEY = 'adBannerDismissed';
 
 /** Clickable sponsor banner for Android. The offer always opens in an external browser. */
 export default function AdsterraBanner({ visible, onSupport, onManualDismiss }: AdsterraBannerProps) {
+  useTranslation();
   const { isAndroid, isTelevision } = usePlatform();
   const { status: supporterStatus } = useSupporter();
   const dismissAnimationRef = useRef<number | null>(null);
@@ -85,7 +87,7 @@ export default function AdsterraBanner({ visible, onSupport, onManualDismiss }: 
     <div
       id="adsterra-banner-container"
       role="complementary"
-      aria-label="Sponsored content"
+      aria-label={i18n.t("ads.sponsored")}
       className="relative flex w-full justify-center overflow-hidden border border-app-border bg-app-surface-raised shadow-[var(--shadow-raised)] transition-all duration-200 ease-out motion-reduce:transition-none"
       style={{
         visibility: isVisible ? 'visible' : 'hidden',
@@ -100,16 +102,16 @@ export default function AdsterraBanner({ visible, onSupport, onManualDismiss }: 
         className="quiet-control flex min-w-0 flex-1 items-center justify-center gap-2 px-3 py-2.5 text-metadata font-medium text-app-text-secondary hover:bg-app-hover hover:text-app-text"
       >
         <ExternalLink className="h-3 w-3 text-app-accent" />
-        <span className="sponsored-label border-0">{isTelevision ? 'Sponsored — View offer' : 'Sponsored'}</span>
+        <span className="sponsored-label border-0">{isTelevision ? `${i18n.t('ads.sponsored')} — ${i18n.t('ads.view_offer')}` : i18n.t('ads.sponsored')}</span>
       </button>
       {onSupport && (
         <button
           type="button"
           onClick={(event) => { event.preventDefault(); event.stopPropagation(); onSupport(); }}
-          className="quiet-control me-9 shrink-0 border-s border-app-border-subtle px-3 py-2 text-[10px] font-semibold text-app-accent hover:bg-app-selected"
-          aria-label="Remove ads forever for $5 once"
+          className="quiet-control me-9 max-w-[50%] shrink-0 border-s border-app-border-subtle px-3 py-2 text-[10px] font-semibold text-app-accent hover:bg-app-selected"
+          aria-label={i18n.t("supporter_license.purchase_action")}
         >
-          Ad-free · $5 once
+          <span className="line-clamp-2">{i18n.t("supporter_license.supporter_tier")}</span>
         </button>
       )}
       <button

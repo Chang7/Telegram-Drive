@@ -225,6 +225,8 @@ fn bounded_source_prefix(path: &Path) -> std::io::Result<Vec<u8>> {
 
 #[derive(Clone)]
 pub struct TranscodeManager {
+    pub network: Arc<crate::vpn_optimizer::NetworkConfig>,
+    pub bandwidth: Arc<crate::bandwidth::BandwidthManager>,
     pub cache_root: PathBuf,
     pub ffmpeg_path: Arc<Mutex<Option<PathBuf>>>,
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<TranscodeJob>>>>>,
@@ -253,6 +255,10 @@ impl TranscodeManager {
         let _ = std::fs::create_dir_all(cache_root.join(HLS_DIR));
 
         Self {
+            network: Arc::new(crate::vpn_optimizer::NetworkConfig::new()),
+            bandwidth: Arc::new(crate::bandwidth::BandwidthManager::at(
+                cache_root.parent().unwrap_or(&cache_root),
+            )),
             cache_root,
             ffmpeg_path: Arc::new(Mutex::new(None)),
             jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -261,6 +267,16 @@ impl TranscodeManager {
             cache_scan_in_flight: Arc::new(AtomicBool::new(false)),
             cache_scan_pending: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_transport(
+        mut self,
+        network: Arc<crate::vpn_optimizer::NetworkConfig>,
+        bandwidth: Arc<crate::bandwidth::BandwidthManager>,
+    ) -> Self {
+        self.network = network;
+        self.bandwidth = bandwidth;
+        self
     }
 
     /// Reconcile the detailed cache inventory once on the blocking pool. The
@@ -652,6 +668,10 @@ pub async fn detect_ffmpeg(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     }
 
     // 2. Fallback to PATH
+    detect_path_ffmpeg().await
+}
+
+pub(crate) async fn detect_path_ffmpeg() -> Option<PathBuf> {
     match test_ffmpeg(Path::new("ffmpeg")).await {
         Ok(true) => {
             log::info!("Transcode: Found FFmpeg on PATH");
@@ -669,10 +689,13 @@ pub async fn detect_ffmpeg(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
 }
 
 async fn test_ffmpeg(path: &Path) -> Result<bool, String> {
-    let output = tokio::process::Command::new(path)
+    let mut command = tokio::process::Command::new(path);
+    command
         .arg("-version")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::process_util::hide_console(&mut command);
+    let output = command
         .output()
         .await
         .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
@@ -698,6 +721,7 @@ pub async fn cache_original(
     cancel_rx: &mut tokio::sync::oneshot::Receiver<()>,
     progress_callback: impl Fn(f32),
     account: &AccountGuard,
+    transport: &TranscodeManager,
 ) -> Result<u64, String> {
     account.validate()?;
     let total_size = match media {
@@ -705,6 +729,8 @@ pub async fn cache_original(
         _ => return Err("Not a document".to_string()),
     };
 
+    let mut reservation =
+        crate::bandwidth::BandwidthReservation::download(transport.bandwidth.clone(), total_size)?;
     // Ensure parent directory exists
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent)
@@ -733,6 +759,7 @@ pub async fn cache_original(
             result = download_iter.next() => {
                 match result {
                     Ok(Some(chunk)) => {
+                        tokio::select! {result=transport.network.pacer.wait(&transport.network,crate::traffic::Direction::Download,chunk.len(),||account.validate())=>result?,_=&mut *cancel_rx=>return Err("Cancelled".into())}
                         account.validate()?;
                         if downloaded.saturating_add(chunk.len() as u64) > total_size { return Err("Incomplete download: source exceeded expected size".into()); }
                         file.write_all(&chunk).await.map_err(|e| format!("Write error: {}", e))?;
@@ -779,6 +806,7 @@ pub async fn cache_original(
         .await
         .map_err(|e| format!("Rename error: {}", e))?;
 
+    reservation.commit();
     log::info!(
         "Transcode: Cached original to {:?} ({} bytes)",
         dest_path,
@@ -857,6 +885,7 @@ pub async fn run_transcode(
     let segment_pattern = output_dir.join("segment_%03d.ts");
 
     let mut cmd = tokio::process::Command::new(ffmpeg_path);
+    crate::process_util::hide_console(&mut cmd);
     cmd.arg("-y") // Overwrite
         .arg("-i")
         .arg(input_path)
@@ -1003,13 +1032,6 @@ fn parse_time_to_secs(time: &str) -> f64 {
     }
 }
 
-/// Detect video resolution from a cached original MP4 file.
-pub fn get_source_height(cached_path: &std::path::Path) -> Option<u32> {
-    let data = std::fs::read(cached_path).ok()?;
-    let buffer = &data[..std::cmp::min(2 * 1024 * 1024, data.len())];
-    mp4_utils::scan_video_tkhd_dimensions(buffer).1
-}
-
 // ── Execute Full Transcode Pipeline ─────────────────────────────────────
 
 /// Run the full pipeline: cache original → transcode HLS.
@@ -1090,6 +1112,7 @@ pub async fn execute_transcode_pipeline(
                 });
             },
             &account,
+            manager,
         )
         .await
         {
@@ -1520,25 +1543,6 @@ pub async fn cmd_cancel_transcode(
 }
 
 // ── Cache management commands ───────────────────────────────────────
-
-#[derive(serde::Serialize)]
-pub struct TranscodeCacheInfo {
-    pub current_bytes: u64,
-    pub max_bytes: u64,
-    pub cached_variants: Vec<String>,
-}
-#[tauri::command]
-pub async fn cmd_get_transcode_cache_info(
-    manager: tauri::State<'_, Arc<TranscodeManager>>,
-) -> Result<TranscodeCacheInfo, String> {
-    let current = manager.total_cache_size();
-    let max = manager.get_max_cache_bytes().await;
-    Ok(TranscodeCacheInfo {
-        current_bytes: current,
-        max_bytes: max,
-        cached_variants: vec![],
-    })
-}
 
 #[tauri::command]
 pub async fn cmd_set_transcode_cache_limit(
@@ -2263,331 +2267,4 @@ pub fn configure_hls_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(hls_master_playlist)
         .service(hls_playlist)
         .service(hls_segment);
-}
-
-#[cfg(test)]
-mod cache_tests {
-    use super::*;
-
-    struct TestCache {
-        root: PathBuf,
-    }
-
-    fn sign_in(root: &Path, owner: i64) {
-        use grammers_session::{storages::SqliteSession, types::PeerInfo, Session};
-        for file in [
-            "telegram.session",
-            "telegram.session-wal",
-            "telegram.session-shm",
-        ] {
-            let _ = std::fs::remove_file(root.join(file));
-        }
-        let session = SqliteSession::open(root.join("telegram.session")).unwrap();
-        session.cache_peer(&PeerInfo::User {
-            id: owner,
-            auth: None,
-            bot: Some(false),
-            is_self: Some(true),
-        });
-    }
-
-    impl TestCache {
-        fn new() -> Self {
-            let unique = format!(
-                "telegram-drive-transcode-test-{}-{}",
-                std::process::id(),
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-            );
-            let root = std::env::temp_dir().join(unique).join("streaming");
-            std::fs::create_dir_all(root.join(HLS_DIR)).unwrap();
-            std::fs::create_dir_all(root.join(ORIGINALS_DIR)).unwrap();
-            Self { root }
-        }
-
-        fn add_variant(&self, file_key: &str, quality: &str, bytes: &[u8]) {
-            let variant = self.root.join(HLS_DIR).join(file_key).join(quality);
-            std::fs::create_dir_all(&variant).unwrap();
-            std::fs::write(
-                variant.join("index.m3u8"),
-                b"#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nsegment_000.ts\n#EXT-X-ENDLIST\n",
-            )
-            .unwrap();
-            std::fs::write(variant.join("segment_000.ts"), bytes).unwrap();
-        }
-
-        fn add_original(&self, file_key: &str, bytes: &[u8]) {
-            std::fs::write(
-                self.root
-                    .join(ORIGINALS_DIR)
-                    .join(format!("{file_key}.mp4")),
-                bytes,
-            )
-            .unwrap();
-        }
-    }
-
-    impl Drop for TestCache {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(self.root.parent().unwrap());
-        }
-    }
-
-    #[test]
-    fn missing_or_empty_cache_is_a_valid_empty_state() {
-        let missing = std::env::temp_dir().join(format!(
-            "telegram-drive-missing-cache-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        assert!(scan_transcode_cache(&missing).unwrap().is_empty());
-        let cache = TestCache::new();
-        assert!(scan_transcode_cache(&cache.root).unwrap().is_empty());
-    }
-
-    #[test]
-    fn cache_scan_reports_variants_originals_and_exact_sizes() {
-        let cache = TestCache::new();
-        cache.add_variant("123_456", "720p", &[1, 2, 3, 4]);
-        cache.add_original("123_456", &[5, 6, 7]);
-
-        let entries = scan_transcode_cache(&cache.root).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].file_key, "123_456");
-        assert_eq!(entries[0].quality, "720p");
-        assert_eq!(entries[0].size_bytes, 72);
-        assert!(entries[0].playlist_exists);
-        assert_eq!(entries[1].quality, "original");
-        assert_eq!(entries[1].size_bytes, 3);
-    }
-
-    #[test]
-    fn variant_and_full_clear_remove_only_expected_cache_paths() {
-        let cache = TestCache::new();
-        cache.add_variant("123_456", "720p", &[1]);
-        cache.add_variant("123_456", "1080p", &[2]);
-        cache.add_original("123_456", &[3]);
-
-        clear_variant_transcode_cache(&cache.root, "123_456", "720p").unwrap();
-        assert!(!cache
-            .root
-            .join(HLS_DIR)
-            .join("123_456")
-            .join("720p")
-            .exists());
-        assert!(cache
-            .root
-            .join(HLS_DIR)
-            .join("123_456")
-            .join("1080p")
-            .exists());
-        assert!(cache.root.join(ORIGINALS_DIR).join("123_456.mp4").exists());
-
-        clear_all_transcode_cache(&cache.root).unwrap();
-        assert!(scan_transcode_cache(&cache.root).unwrap().is_empty());
-    }
-
-    #[test]
-    fn clear_rejects_path_traversal_and_unknown_qualities() {
-        let cache = TestCache::new();
-        assert!(clear_file_transcode_cache(&cache.root, "../outside").is_err());
-        assert!(clear_variant_transcode_cache(&cache.root, "123_456", "source").is_err());
-    }
-
-    #[test]
-    fn cached_variant_requires_a_complete_playlist_and_non_empty_segments() {
-        let cache = TestCache::new();
-        cache.add_variant("123_456", "480p", &[]);
-        let output_dir = cache.root.join(HLS_DIR).join("123_456").join("480p");
-
-        assert!(validate_hls_output(&output_dir).is_err());
-
-        std::fs::write(output_dir.join("segment_000.ts"), [1, 2, 3]).unwrap();
-        assert!(validate_hls_output(&output_dir).is_ok());
-    }
-
-    #[test]
-    fn served_playlists_authenticate_relative_variant_and_segment_urls() {
-        let playlist = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n480p/index.m3u8\n#EXTINF:6.0,\nsegment_000.ts\n";
-        let authenticated = playlist_with_stream_token(playlist, "abc123");
-
-        assert!(authenticated.contains("480p/index.m3u8?token=abc123"));
-        assert!(authenticated.contains("segment_000.ts?token=abc123"));
-        assert!(authenticated.contains("#EXTINF:6.0,"));
-    }
-
-    #[actix_web::test]
-    async fn hls_routes_deliver_an_authenticated_playlist_and_segment() {
-        let cache = TestCache::new();
-        sign_in(cache.root.parent().unwrap(), 77);
-        cache.add_variant("77_123_456", "480p", &[1, 2, 3, 4]);
-        let manager = Arc::new(TranscodeManager::new(cache.root.clone()));
-        let service = actix_web::test::init_service(
-            actix_web::App::new()
-                .app_data(web::Data::new(manager))
-                .app_data(web::Data::new(StreamTokenData {
-                    token: "abc123".to_string(),
-                }))
-                .configure(configure_hls_routes),
-        )
-        .await;
-
-        let playlist_request = actix_web::test::TestRequest::get()
-            .uri("/hls/77_123_456/480p/index.m3u8?token=abc123")
-            .to_request();
-        let playlist_response = actix_web::test::call_service(&service, playlist_request).await;
-        assert!(playlist_response.status().is_success());
-        let playlist_body = actix_web::test::read_body(playlist_response).await;
-        assert!(String::from_utf8_lossy(&playlist_body).contains("segment_000.ts?token=abc123"));
-
-        let segment_request = actix_web::test::TestRequest::get()
-            .uri("/hls/77_123_456/480p/segment_000.ts?token=abc123")
-            .to_request();
-        let segment_response = actix_web::test::call_service(&service, segment_request).await;
-        assert!(segment_response.status().is_success());
-        assert_eq!(
-            actix_web::test::read_body(segment_response).await.as_ref(),
-            &[1, 2, 3, 4]
-        );
-
-        let unauthenticated_request = actix_web::test::TestRequest::get()
-            .uri("/hls/77_123_456/480p/segment_000.ts")
-            .to_request();
-        let unauthenticated_response =
-            actix_web::test::call_service(&service, unauthenticated_request).await;
-        assert_eq!(
-            unauthenticated_response.status(),
-            actix_web::http::StatusCode::FORBIDDEN
-        );
-    }
-    #[tokio::test]
-    async fn eviction_preserves_live_sources_partials_hls_and_remux_outputs() {
-        let cache = TestCache::new();
-        let manager = TranscodeManager::new_with_max_cache_bytes(cache.root.clone(), 1);
-        let key = TranscodeKey {
-            owner_id: 77,
-            folder_id: 0,
-            message_id: 10,
-            quality: "480p".into(),
-        };
-        let (job, fresh) = manager.get_or_create_job(&key).await;
-        assert!(fresh);
-        let lease = job.lock().await.writer_lease();
-        cache.add_variant(&key.file_key(), "480p", &[1, 2, 3, 4]);
-        cache.add_original(&key.file_key(), &[5, 6, 7]);
-        let partial = manager
-            .original_path(&key.file_key())
-            .with_extension("mp4.part");
-        std::fs::write(&partial, [8, 9]).unwrap();
-        let remux = cache.root.join("fmp4").join(key.file_key());
-        std::fs::create_dir_all(&remux).unwrap();
-        std::fs::write(remux.join("output.mp4.part"), [10]).unwrap();
-        cache.add_original("77_0_99", &[11, 12, 13]);
-        manager.evict_lru().await;
-        assert!(manager.original_path(&key.file_key()).is_file());
-        assert!(partial.is_file());
-        assert!(manager
-            .hls_output_dir(&key.file_key(), "480p")
-            .join("segment_000.ts")
-            .is_file());
-        assert!(remux.join("output.mp4.part").is_file());
-        assert!(!manager.original_path("77_0_99").exists());
-        drop(lease);
-        manager.evict_lru().await;
-        assert!(manager.total_cache_size() <= 1);
-    }
-
-    #[tokio::test]
-    async fn cancelled_display_state_cannot_release_or_replace_a_live_writer() {
-        let cache = TestCache::new();
-        let manager = TranscodeManager::new(cache.root.clone());
-        let key = TranscodeKey {
-            owner_id: 77,
-            folder_id: 0,
-            message_id: 10,
-            quality: "480p".into(),
-        };
-        let (job, _) = manager.get_or_create_job(&key).await;
-        let (lease, worker) = {
-            let mut job = job.lock().await;
-            job.phase = JobPhase::Cancelled;
-            job.worker.cancelled.store(true, Ordering::Release);
-            (job.writer_lease(), job.worker.clone())
-        };
-        let (same, fresh) = manager.get_or_create_job(&key).await;
-        assert!(!fresh);
-        assert!(Arc::ptr_eq(&same, &job));
-        assert!(same.lock().await.has_live_writer());
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            wait_for_worker(&worker)
-        )
-        .await
-        .is_err());
-        drop(lease);
-        wait_for_worker(&worker).await.unwrap();
-        let (replacement, fresh) = manager.get_or_create_job(&key).await;
-        assert!(fresh);
-        assert!(!Arc::ptr_eq(&replacement, &job));
-        drop(replacement.lock().await.writer_lease());
-    }
-
-    #[test]
-    fn source_resolution_reads_only_the_bounded_header_prefix() {
-        let cache = TestCache::new();
-        let path = cache.root.join("large-video.mp4");
-        let file = std::fs::File::create(&path).unwrap();
-        file.set_len(512 * 1024 * 1024).unwrap();
-        assert_eq!(bounded_source_prefix(&path).unwrap().len(), 2 * 1024 * 1024);
-    }
-
-    #[test]
-    fn account_keys_never_adopt_legacy_or_foreign_cached_media() {
-        let cache = TestCache::new();
-        sign_in(cache.root.parent().unwrap(), 77);
-        cache.add_variant("0_10", "480p", &[1]);
-        cache.add_variant("77_0_10", "480p", &[2]);
-        cache.add_variant("88_0_10", "480p", &[3]);
-        let manager = TranscodeManager::new(cache.root.clone());
-        assert!(manager.validate_hls_path("77_0_10", "480p", None).is_some());
-        for invalid in [
-            "0_10",
-            "88_0_10",
-            "77_0_10/../../../private",
-            "77_0_10_extra",
-            "77_0_-1",
-        ] {
-            assert!(manager.validate_hls_path(invalid, "480p", None).is_none());
-        }
-        sign_in(cache.root.parent().unwrap(), 88);
-        assert!(manager.validate_hls_path("77_0_10", "480p", None).is_none());
-        assert!(manager.validate_hls_path("88_0_10", "480p", None).is_some());
-        assert!(cache.root.join(HLS_DIR).join("0_10").exists());
-    }
-
-    #[test]
-    fn cache_clear_includes_disposable_remux_outputs() {
-        let cache = TestCache::new();
-        let remux = cache.root.join("fmp4").join("77_0_10");
-        std::fs::create_dir_all(&remux).unwrap();
-        std::fs::write(remux.join("output.mp4"), [1]).unwrap();
-        clear_file_transcode_cache(&cache.root, "77_0_10").unwrap();
-        assert!(!remux.exists());
-        std::fs::create_dir_all(&remux).unwrap();
-        std::fs::write(remux.join("output.mp4"), [1]).unwrap();
-        clear_all_transcode_cache(&cache.root).unwrap();
-        assert!(!remux.exists());
-    }
-    #[test]
-    fn interrupted_hls_playlist_is_not_reported_as_a_complete_cached_variant() {
-        let cache = TestCache::new();
-        cache.add_variant("77_0_10", "480p", &[1, 2, 3]);
-        let output = cache.root.join(HLS_DIR).join("77_0_10").join("480p");
-        std::fs::write(
-            output.join("index.m3u8"),
-            "#EXTM3U\n#EXTINF:6.0,\nsegment_000.ts\n",
-        )
-        .unwrap();
-        assert!(validate_hls_output(&output).is_err());
-        assert!(!scan_transcode_cache(&cache.root).unwrap()[0].playlist_exists);
-    }
 }

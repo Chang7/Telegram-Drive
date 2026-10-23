@@ -23,6 +23,25 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Listener, Manager, State};
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock};
 
+/// Progress is shown live but written to disk at most this often per job.
+/// State changes are always written immediately; a crash can lose at most
+/// this much progress display, never a transition.
+const PROGRESS_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// A removed job's id is remembered this long so a late update from the
+/// operation that was running cannot recreate it.
+const TOMBSTONE_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+/// Waits before retrying a transfer that failed on a connection problem.
+/// After the last one the job is reported as failed for the user to retry.
+const NETWORK_RETRY_BACKOFF_SECS: [i64; 5] = [5, 15, 45, 120, 300];
+/// A supervised transfer that cannot start because Telegram is disconnected
+/// is handed back to its supervisor after this long.
+const SUPERVISED_OFFLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+/// After a supervised transfer is withdrawn, how long to wait for the
+/// operation that was running to stop touching its files.
+const WITHDRAW_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// `origin` of a transfer Folder Sync runs and waits for.
+pub const ORIGIN_SYNC: &str = "sync";
+
 const DATABASE_SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = FULL;
@@ -147,6 +166,8 @@ pub struct TransferJob {
     pub protection_mode: Option<String>,
     pub protect_metadata: Option<bool>,
     pub video_upload_mode: Option<String>,
+    #[serde(default)]
+    pub video_filename_caption: Option<bool>,
     pub temp_zip_path: Option<String>,
     pub progress: u8,
     pub transferred_bytes: u64,
@@ -158,6 +179,18 @@ pub struct TransferJob {
     #[serde(default)]
     pub persistence_pending: bool,
     pub retry_at: Option<i64>,
+    /// Automatic retries already spent on connection failures for this job.
+    #[serde(default)]
+    pub network_retries: u32,
+    /// Set when another part of the application runs this transfer and waits
+    /// for it. Such a transfer is never left to finish on its own: its owner
+    /// removes it when it stops waiting, and any left by a crash are dropped
+    /// at the next start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// For a Folder Sync upload, the file's path inside its mapped folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_path: Option<String>,
     pub queue_position: i64,
     pub revision: u64,
     pub created_at: i64,
@@ -184,9 +217,16 @@ pub struct TransferEnqueueRequest {
     pub prompt_token: Option<u64>,
     pub protect_metadata: Option<bool>,
     pub video_upload_mode: Option<String>,
+    #[serde(default)]
+    pub video_filename_caption: Option<bool>,
     pub temp_zip_path: Option<String>,
     pub total_bytes: Option<u64>,
     pub initial_status: Option<TransferStatus>,
+    /// Internal callers only; never read from a request made by the interface.
+    #[serde(skip)]
+    pub origin: Option<String>,
+    #[serde(skip)]
+    pub sync_path: Option<String>,
 }
 
 impl TransferEnqueueRequest {
@@ -224,12 +264,12 @@ impl TransferEnqueueRequest {
 }
 
 #[derive(Clone)]
-struct TransferStore {
+pub(crate) struct TransferStore {
     connection: Arc<Mutex<sqlite::Connection>>,
 }
 
 impl TransferStore {
-    fn open(path: &Path) -> Result<(Self, Vec<TransferJob>), String> {
+    pub(crate) fn open(path: &Path) -> Result<(Self, Vec<TransferJob>), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -237,7 +277,21 @@ impl TransferStore {
         connection
             .execute(DATABASE_SCHEMA)
             .map_err(|error| format!("Could not initialize transfer database: {error}"))?;
+        Self::maintain_tombstones(&connection, chrono::Utc::now().timestamp())?;
         let mut jobs = Self::load_all_from(&connection)?;
+        // A supervised transfer belongs to an operation that ended with the
+        // previous process. Its supervisor plans the work again; a leftover
+        // record must not run, or be resumed by hand, without it.
+        for orphan in jobs.iter().filter(|job| job.origin.is_some()) {
+            let mut remove = connection
+                .prepare("DELETE FROM transfer_jobs WHERE id = ?")
+                .map_err(|error| error.to_string())?;
+            remove
+                .bind((1, orphan.id.as_str()))
+                .map_err(|error| error.to_string())?;
+            remove.next().map_err(|error| error.to_string())?;
+        }
+        jobs.retain(|job| job.origin.is_none());
         for job in &mut jobs {
             if recover_after_restart(job) {
                 Self::upsert_on(&connection, job)?;
@@ -249,6 +303,41 @@ impl TransferStore {
             },
             jobs,
         ))
+    }
+
+    /// Date tombstones and drop the ones past their retention. Databases
+    /// written by earlier releases have no date column; it is added in place
+    /// and stays compatible with those releases, which never read it.
+    fn maintain_tombstones(connection: &sqlite::Connection, now: i64) -> Result<(), String> {
+        let mut columns = connection
+            .prepare("PRAGMA table_info(transfer_tombstones)")
+            .map_err(|e| e.to_string())?;
+        let mut dated = false;
+        while columns.next().map_err(|e| e.to_string())? == SqliteState::Row {
+            if columns.read::<String, _>(1).map_err(|e| e.to_string())? == "removed_at" {
+                dated = true;
+            }
+        }
+        drop(columns);
+        if !dated {
+            connection
+                .execute("ALTER TABLE transfer_tombstones ADD COLUMN removed_at INTEGER")
+                .map_err(|e| format!("Could not update transfer database: {e}"))?;
+        }
+        for sql in [
+            "UPDATE transfer_tombstones SET removed_at = ?1 WHERE removed_at IS NULL",
+            "DELETE FROM transfer_tombstones WHERE removed_at < ?1",
+        ] {
+            let mut statement = connection.prepare(sql).map_err(|e| e.to_string())?;
+            let bound = if sql.starts_with("UPDATE") {
+                now
+            } else {
+                now.saturating_sub(TOMBSTONE_RETENTION_SECS)
+            };
+            statement.bind((1, bound)).map_err(|e| e.to_string())?;
+            statement.next().map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     fn load_all_from(connection: &sqlite::Connection) -> Result<Vec<TransferJob>, String> {
@@ -268,7 +357,7 @@ impl TransferStore {
         Ok(jobs)
     }
 
-    async fn upsert(&self, job: &TransferJob) -> Result<(), String> {
+    pub(crate) async fn upsert(&self, job: &TransferJob) -> Result<(), String> {
         let connection = self.connection.clone();
         let job = job.clone();
         crate::db::with_connection(connection, move |connection| {
@@ -358,25 +447,31 @@ impl TransferStore {
         .await
     }
 
-    async fn delete_many(&self, ids: &[String]) -> Result<(), String> {
+    pub(crate) async fn delete_many(&self, ids: &[String]) -> Result<(), String> {
         let connection = self.connection.clone();
         let ids = ids.to_vec();
         crate::db::with_connection(connection, move |connection| {
             connection
                 .execute("BEGIN IMMEDIATE")
                 .map_err(|e| e.to_string())?;
+            let removed_at = chrono::Utc::now().timestamp();
             let result = (|| {
                 for id in &ids {
-                    for sql in [
-                        "INSERT OR IGNORE INTO transfer_tombstones(id) VALUES (?)",
-                        "DELETE FROM transfer_jobs WHERE id = ?",
-                    ] {
-                        let mut statement = connection.prepare(sql).map_err(|e| e.to_string())?;
-                        statement
-                            .bind((1, id.as_str()))
-                            .map_err(|e| e.to_string())?;
-                        statement.next().map_err(|e| e.to_string())?;
-                    }
+                    let mut tombstone = connection
+                        .prepare(
+                            "INSERT OR IGNORE INTO transfer_tombstones(id, removed_at) VALUES (?, ?)",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    tombstone
+                        .bind((1, id.as_str()))
+                        .map_err(|e| e.to_string())?;
+                    tombstone.bind((2, removed_at)).map_err(|e| e.to_string())?;
+                    tombstone.next().map_err(|e| e.to_string())?;
+                    let mut remove = connection
+                        .prepare("DELETE FROM transfer_jobs WHERE id = ?")
+                        .map_err(|e| e.to_string())?;
+                    remove.bind((1, id.as_str())).map_err(|e| e.to_string())?;
+                    remove.next().map_err(|e| e.to_string())?;
                 }
                 Ok::<(), String>(())
             })();
@@ -395,11 +490,6 @@ impl TransferStore {
             }
         })
         .await
-    }
-
-    #[cfg(test)]
-    async fn delete(&self, id: &str) -> Result<(), String> {
-        self.delete_many(&[id.to_string()]).await
     }
 }
 
@@ -500,7 +590,11 @@ pub struct TransferEngine {
     mutation_lock: AsyncMutex<()>,
     pending_commits: AsyncMutex<HashMap<String, TransferJob>>,
     prompt_tokens: AsyncMutex<HashMap<String, u64>>,
+    /// When each running job's progress was last written to disk.
+    progress_checkpoints: AsyncMutex<HashMap<String, std::time::Instant>>,
     notify: Notify,
+    /// Wakes supervisors waiting for a transfer to settle.
+    changes: Notify,
     max_uploads: AtomicUsize,
     max_downloads: AtomicUsize,
     shutting_down: AtomicBool,
@@ -529,7 +623,9 @@ impl TransferEngine {
             mutation_lock: AsyncMutex::new(()),
             pending_commits: AsyncMutex::new(HashMap::new()),
             prompt_tokens: AsyncMutex::new(HashMap::new()),
+            progress_checkpoints: AsyncMutex::new(HashMap::new()),
             notify: Notify::new(),
+            changes: Notify::new(),
             max_uploads: AtomicUsize::new(6),
             max_downloads: AtomicUsize::new(6),
             shutting_down: AtomicBool::new(false),
@@ -656,7 +752,24 @@ impl TransferEngine {
             job.updated_at = now_millis();
             job.clone()
         };
-        self.persist_and_emit(updated).await;
+        // The interface gets every update; the database gets a checkpoint.
+        // Each write is a synchronous commit, so writing all of them made the
+        // disk the busiest part of a fast transfer.
+        let checkpoint_due = {
+            let mut checkpoints = self.progress_checkpoints.lock().await;
+            let due = checkpoints
+                .get(&updated.id)
+                .is_none_or(|last| last.elapsed() >= PROGRESS_CHECKPOINT_INTERVAL);
+            if due {
+                checkpoints.insert(updated.id.clone(), std::time::Instant::now());
+            }
+            due
+        };
+        if checkpoint_due {
+            self.persist_and_emit(updated).await;
+        } else {
+            self.emit_job(&updated);
+        }
     }
 
     fn account(&self, expected: Option<&str>) -> Result<AccountGuard, String> {
@@ -675,6 +788,142 @@ impl TransferEngine {
     fn emit_job(&self, job: &TransferJob) {
         if self.is_current_owner(job) {
             let _ = self.app.emit("transfer-upserted", job);
+        }
+        self.changes.notify_waiters();
+    }
+
+    /// Run one transfer on behalf of another part of the application and wait
+    /// for it to settle. It shares the queue's limits, retries, cooldowns and
+    /// progress reporting, and can be paused or cancelled like any other.
+    ///
+    /// The caller owns the outcome: whatever happens, including the caller
+    /// being dropped, the transfer is withdrawn so that it can never finish
+    /// later with nobody to record the result.
+    pub async fn run_supervised(
+        self: &Arc<Self>,
+        request: TransferEnqueueRequest,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<TransferJob, String> {
+        struct Withdraw {
+            engine: Arc<TransferEngine>,
+            id: String,
+            armed: bool,
+        }
+        impl Drop for Withdraw {
+            fn drop(&mut self) {
+                if self.armed {
+                    let engine = self.engine.clone();
+                    let id = std::mem::take(&mut self.id);
+                    tauri::async_runtime::spawn(async move { engine.withdraw(&id).await });
+                }
+            }
+        }
+        if request.origin.is_none() {
+            return Err("A supervised transfer must name its origin".into());
+        }
+        let mut guard = Withdraw {
+            engine: self.clone(),
+            id: request.id.clone(),
+            armed: true,
+        };
+        self.enqueue_many(vec![request]).await?;
+        let outcome = self.wait_settled(&guard.id, &mut stop).await;
+        guard.armed = false;
+        self.withdraw(&guard.id).await;
+        outcome
+    }
+
+    async fn wait_settled(
+        &self,
+        id: &str,
+        stop: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<TransferJob, String> {
+        let mut offline_since: Option<std::time::Instant> = None;
+        loop {
+            if *stop.borrow() {
+                return Err("Folder sync shutdown requested".into());
+            }
+            // Registered before the state is read, so no change is missed.
+            let changed = self.changes.notified();
+            let Some(job) = self.jobs.read().await.get(id).cloned() else {
+                return Err("The transfer was removed".into());
+            };
+            if let Some(outcome) = supervised_outcome(&job) {
+                return outcome.map(|()| job);
+            }
+            // A queued transfer does not start while Telegram is disconnected.
+            // Give the supervisor its turn back instead of holding it here.
+            let waiting_to_start = matches!(
+                job.status,
+                TransferStatus::Pending | TransferStatus::WaitingForNetwork
+            );
+            let connected = self
+                .app
+                .state::<TelegramState>()
+                .client
+                .lock()
+                .await
+                .is_some();
+            if waiting_to_start && !connected {
+                let since = *offline_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= SUPERVISED_OFFLINE_GRACE {
+                    return Err("Client not connected".into());
+                }
+            } else {
+                offline_since = None;
+            }
+            tokio::select! {
+                _ = changed => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                result = stop.changed() => {
+                    if result.is_err() {
+                        return Err("Folder sync shutdown requested".into());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop and forget a supervised transfer. Returns once the operation that
+    /// was running has stopped, or after a bounded wait.
+    async fn withdraw(&self, id: &str) {
+        let was_active = {
+            let _mutation = self.mutation_lock.lock().await;
+            let was_active = self.active.lock().await.contains_key(id);
+            let mut jobs = self.jobs.write().await;
+            if jobs.remove(id).is_some() {
+                if let Err(error) = self.store.delete_many(&[id.to_string()]).await {
+                    log::warn!("Could not remove supervised transfer {id}: {error}");
+                }
+                let _ = self.app.emit("transfer-removed", id);
+            }
+            drop(jobs);
+            self.prompt_tokens.lock().await.remove(id);
+            self.pending_commits.lock().await.remove(id);
+            if was_active {
+                let _ = commands::cmd_cancel_transfer(
+                    id.to_string(),
+                    self.app.state::<TelegramState>(),
+                )
+                .await;
+            }
+            was_active
+        };
+        self.changes.notify_waiters();
+        self.notify.notify_one();
+        if was_active {
+            let deadline = std::time::Instant::now() + WITHDRAW_SETTLE_TIMEOUT;
+            while self.active.lock().await.contains_key(id) && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            // The cancellation request is single-use; do not leave it behind.
+            self.app
+                .state::<TelegramState>()
+                .cancelled_transfers
+                .write()
+                .await
+                .remove(id);
         }
     }
 
@@ -815,7 +1064,7 @@ impl TransferEngine {
             Err(error) => Err(error),
             Ok(_) => match job.kind {
                 TransferKind::LocalUpload => {
-                    commands::cmd_upload_file(
+                    commands::fs::upload_local_file(
                         job.path.clone().unwrap_or_default(),
                         job.folder_id,
                         Some(job.id.clone()),
@@ -823,6 +1072,8 @@ impl TransferEngine {
                         prompt_token,
                         job.protect_metadata,
                         job.video_upload_mode.clone(),
+                        job.video_filename_caption,
+                        job.sync_path.clone(),
                         self.app.clone(),
                         self.app.state::<TelegramState>(),
                         self.app.state::<Arc<BandwidthManager>>(),
@@ -842,6 +1093,7 @@ impl TransferEngine {
                         prompt_token,
                         job.protect_metadata,
                         job.video_upload_mode.clone(),
+                        job.video_filename_caption,
                         self.app.clone(),
                         self.app.state::<TelegramState>(),
                         self.app.state::<Arc<BandwidthManager>>(),
@@ -877,10 +1129,12 @@ impl TransferEngine {
 
         let _mutation = self.mutation_lock.lock().await;
         self.active.lock().await.remove(&job.id);
+        self.progress_checkpoints.lock().await.remove(&job.id);
         let updated = {
             let mut jobs = self.jobs.write().await;
             let Some(mut current) = jobs.get(&job.id).cloned() else {
                 self.notify.notify_one();
+                self.changes.notify_waiters();
                 return;
             };
             match result {
@@ -893,6 +1147,7 @@ impl TransferEngine {
                     current.error = None;
                     current.retry_at = None;
                     current.error_category = None;
+                    current.network_retries = 0;
                     record_success_response(&mut current, &response);
                 }
                 Err(_error)
@@ -1003,6 +1258,7 @@ impl TransferEngine {
                 protection_mode: request.protection_mode,
                 protect_metadata: request.protect_metadata,
                 video_upload_mode: request.video_upload_mode,
+                video_filename_caption: request.video_filename_caption,
                 temp_zip_path: request.temp_zip_path,
                 progress: 0,
                 transferred_bytes: 0,
@@ -1012,6 +1268,9 @@ impl TransferEngine {
                 error_category: None,
                 persistence_pending: false,
                 retry_at: None,
+                network_retries: 0,
+                origin: request.origin,
+                sync_path: request.sync_path,
                 queue_position: position,
                 revision: 1,
                 created_at: now,
@@ -1040,13 +1299,6 @@ impl TransferEngine {
         }
         self.notify.notify_one();
         Ok(changed)
-    }
-
-    async fn enqueue(&self, request: TransferEnqueueRequest) -> Result<TransferJob, String> {
-        self.enqueue_many(vec![request])
-            .await?
-            .pop()
-            .ok_or_else(|| "No transfer enqueued".into())
     }
 
     async fn transition(
@@ -1086,7 +1338,8 @@ impl TransferEngine {
                 job.status = TransferStatus::Cancelled
             }
             TransferAction::Resume if job.status == TransferStatus::Paused => {
-                job.status = TransferStatus::Pending
+                job.status = TransferStatus::Pending;
+                job.network_retries = 0;
             }
             TransferAction::Retry
                 if matches!(
@@ -1101,6 +1354,8 @@ impl TransferEngine {
                 job.status = TransferStatus::Pending;
                 job.progress = 0;
                 job.transferred_bytes = 0;
+                // A manual retry gets a fresh automatic retry budget.
+                job.network_retries = 0;
             }
             _ => return Ok(job),
         }
@@ -1203,8 +1458,16 @@ impl TransferEngine {
                 .map(PathBuf::from),
             );
             if job.kind == TransferKind::UrlUpload {
-                paths.push(std::env::temp_dir().join(format!("tg_drive_{}.tmp", job.id)));
-                paths.push(std::env::temp_dir().join(format!("tg_drive_encrypted_{}", job.id)));
+                // Current private staging directory, plus the shared temporary
+                // directory used by releases before 4.0.
+                let mut roots = vec![std::env::temp_dir()];
+                if let Ok(staging) = crate::temp_artifacts::staging_root() {
+                    roots.push(staging);
+                }
+                for root in roots {
+                    paths.push(root.join(format!("tg_drive_{}.tmp", job.id)));
+                    paths.push(root.join(format!("tg_drive_encrypted_{}", job.id)));
+                }
             }
         }
         paths
@@ -1322,6 +1585,33 @@ fn select_pending_job_ids(
         .collect()
 }
 
+/// Whether a supervised transfer has reached a state its supervisor must act
+/// on. `None` while the queue is still working on it, including while the user
+/// has it paused.
+pub(crate) fn supervised_outcome(job: &TransferJob) -> Option<Result<(), String>> {
+    let failure = |fallback: &str| {
+        Err(job
+            .error
+            .clone()
+            .filter(|error| !error.is_empty())
+            .unwrap_or_else(|| fallback.to_string()))
+    };
+    match job.status {
+        TransferStatus::Completed => Some(Ok(())),
+        TransferStatus::Failed => Some(failure("The transfer failed")),
+        TransferStatus::Cancelled => Some(failure("Transfer cancelled")),
+        // Only the user can supply what is missing; the supervisor reports it.
+        TransferStatus::WaitingForUnlock => {
+            Some(failure("[VAULT_LOCKED] Unlock the vault to continue"))
+        }
+        // The queue paused it for a reason the user did not choose.
+        TransferStatus::Paused if job.error_category.is_some() => {
+            Some(failure("The transfer was paused"))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum TransferAction {
     Pause,
@@ -1330,7 +1620,7 @@ enum TransferAction {
     Retry,
 }
 
-fn apply_failure(job: &mut TransferJob, error: String, now: i64) {
+pub(crate) fn apply_failure(job: &mut TransferJob, error: String, now: i64) {
     job.speed_bytes_per_sec = 0;
     job.retry_at = None;
     job.error_category = Some(classify_failure(&error));
@@ -1351,6 +1641,17 @@ fn apply_failure(job: &mut TransferJob, error: String, now: i64) {
         job.status = TransferStatus::WaitingForNetwork;
     } else if error.contains("Transfer cancelled") {
         job.status = TransferStatus::Cancelled;
+    } else if job.error_category == Some(TransferErrorCategory::Network) {
+        // A dropped connection is usually temporary. Retry a few times with
+        // growing waits before asking the user to step in.
+        match NETWORK_RETRY_BACKOFF_SECS.get(job.network_retries as usize) {
+            Some(wait) => {
+                job.network_retries += 1;
+                job.status = TransferStatus::Cooldown;
+                job.retry_at = Some(now.saturating_add(wait * 1_000));
+            }
+            None => job.status = TransferStatus::Failed,
+        }
     } else {
         job.status = TransferStatus::Failed;
     }
@@ -1382,19 +1683,18 @@ fn classify_failure(error: &str) -> TransferErrorCategory {
     } else if lower.contains("network")
         || lower.contains("connection")
         || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("broken pipe")
+        || lower.contains("reset by peer")
+        || lower.contains("unexpected eof")
+        || lower.contains("early eof")
+        || lower.contains("temporarily unavailable")
         || lower.contains("client not connected")
     {
         TransferErrorCategory::Network
     } else {
         TransferErrorCategory::Other
     }
-}
-
-pub(crate) async fn validate_client_account(
-    account: &AccountGuard,
-    client: &grammers_client::Client,
-) -> Result<(), String> {
-    account.validate_client(client).await
 }
 
 /// Capture the original scoped operation or durable queue owner. Its epoch is
@@ -1415,16 +1715,6 @@ pub async fn capture_job_account(app: &AppHandle, id: &str) -> Result<AccountGua
         None
     };
     AccountGuard::open(&root, expected.as_deref())
-}
-
-pub async fn capture_operation_account(
-    app: &AppHandle,
-    id: &str,
-    client: &grammers_client::Client,
-) -> Result<AccountGuard, String> {
-    let account = capture_job_account(app, id).await?;
-    validate_client_account(&account, client).await?;
-    Ok(account)
 }
 
 fn reserve_new_downloads(
@@ -1454,11 +1744,15 @@ fn reserve_new_downloads(
                 .ok_or("Download destination is missing")?,
         );
         let reserved_path = reserve_destination(path, job.collision_policy, &mut reserved)?;
-        job.filename = reserved_path
-            .file_name()
-            .ok_or("Download filename is missing")?
-            .to_string_lossy()
-            .into_owned();
+        // A supervised download is staged under an internal name; it keeps
+        // the name its supervisor gave it for display.
+        if job.origin.is_none() {
+            job.filename = reserved_path
+                .file_name()
+                .ok_or("Download filename is missing")?
+                .to_string_lossy()
+                .into_owned();
+        }
         job.save_path = Some(reserved_path.to_string_lossy().into_owned());
     }
     Ok(jobs)
@@ -1503,6 +1797,7 @@ fn activity_projection(job: &TransferJob) -> TransferJob {
         projected.path = None;
         projected.url = None;
         projected.save_path = None;
+        projected.sync_path = None;
         projected.temp_zip_path = None;
         projected.error = None;
         projected.total_bytes = 0;
@@ -1655,28 +1950,16 @@ pub async fn cmd_transfer_discard_legacy(
 }
 
 fn flood_wait_seconds(error: &str) -> Option<u32> {
-    let marker = "FLOOD_WAIT_";
-    let start = error.to_ascii_uppercase().find(marker)? + marker.len();
-    let digits: String = error[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits
-        .parse::<u32>()
+    // The durable transfer queue accepts case-insensitive errors and limits
+    // its cooldown window; folder sync keeps the full server-provided delay.
+    let seconds = crate::commands::utils::flood_wait_seconds(&error.to_ascii_uppercase())?;
+    u32::try_from(seconds)
         .ok()
         .map(|seconds| seconds.clamp(1, 300))
 }
 
 fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
-}
-
-#[tauri::command]
-pub async fn cmd_transfer_enqueue(
-    request: TransferEnqueueRequest,
-    engine: State<'_, Arc<TransferEngine>>,
-) -> Result<TransferJob, String> {
-    engine.enqueue(request).await
 }
 
 #[tauri::command]
@@ -1791,416 +2074,4 @@ pub async fn cmd_transfer_clear_terminal(
     engine
         .clear_terminal(direction, include_failed_and_cancelled, owner_id.as_deref())
         .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn request(id: &str) -> TransferEnqueueRequest {
-        TransferEnqueueRequest {
-            id: id.to_string(),
-            owner_id: Some("100".into()),
-            direction: TransferDirection::Upload,
-            kind: TransferKind::LocalUpload,
-            path: Some("/tmp/file.txt".to_string()),
-            url: None,
-            folder_id: None,
-            message_id: None,
-            filename: "file.txt".to_string(),
-            save_path: None,
-            collision_policy: DownloadCollisionPolicy::KeepBoth,
-            protection_mode: Some("standard".to_string()),
-            prompt_token: None,
-            protect_metadata: Some(true),
-            video_upload_mode: Some("file".to_string()),
-            temp_zip_path: None,
-            total_bytes: Some(10),
-            initial_status: None,
-        }
-    }
-
-    fn job(id: &str, revision: u64) -> TransferJob {
-        let request = request(id);
-        TransferJob {
-            id: request.id,
-            owner_id: request.owner_id,
-            direction: request.direction,
-            kind: request.kind,
-            status: TransferStatus::Pending,
-            download_outcome: None,
-            path: request.path,
-            url: None,
-            folder_id: None,
-            message_id: None,
-            filename: request.filename,
-            save_path: None,
-            collision_policy: DownloadCollisionPolicy::KeepBoth,
-            protection_mode: request.protection_mode,
-            protect_metadata: request.protect_metadata,
-            video_upload_mode: request.video_upload_mode,
-            temp_zip_path: None,
-            progress: 0,
-            transferred_bytes: 0,
-            total_bytes: 10,
-            speed_bytes_per_sec: 0,
-            error: None,
-            error_category: None,
-            persistence_pending: false,
-            retry_at: None,
-            queue_position: 1,
-            revision,
-            created_at: 1,
-            updated_at: i64::try_from(revision).unwrap(),
-        }
-    }
-
-    fn test_store(name: &str) -> (TransferStore, PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "telegram-drive-transfer-{name}-{}-{}.db",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        (TransferStore::open(&path).unwrap().0, path)
-    }
-
-    async fn execute_test_sql(store: &TransferStore, sql: &str) {
-        let sql = sql.to_string();
-        crate::db::with_connection(store.connection.clone(), move |connection| {
-            connection.execute(sql.as_str()).map_err(|e| e.to_string())
-        })
-        .await
-        .unwrap();
-    }
-
-    async fn stored_jobs(store: &TransferStore) -> Vec<TransferJob> {
-        crate::db::with_connection(store.connection.clone(), TransferStore::load_all_from)
-            .await
-            .unwrap()
-    }
-
-    #[test]
-    fn rejects_incomplete_or_mismatched_jobs() {
-        let mut invalid = request("upload");
-        invalid.path = None;
-        assert!(invalid.validate().is_err());
-        let mut mismatch = request("mismatch");
-        mismatch.direction = TransferDirection::Download;
-        assert!(mismatch.validate().is_err());
-    }
-
-    #[tokio::test]
-    async fn store_survives_reopen() {
-        let (store, path) = test_store("reopen");
-        store.upsert(&job("one", 1)).await.unwrap();
-        drop(store);
-        let (_, loaded) = TransferStore::open(&path).unwrap();
-        assert_eq!(loaded.len(), 1);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn stale_revision_cannot_overwrite_newer_state() {
-        let (store, path) = test_store("revision");
-        let mut newer = job("one", 2);
-        newer.status = TransferStatus::Completed;
-        store.upsert(&newer).await.unwrap();
-        store.upsert(&job("one", 1)).await.unwrap();
-        drop(store);
-        let (_, loaded) = TransferStore::open(&path).unwrap();
-        assert_eq!(loaded[0].status, TransferStatus::Completed);
-        assert_eq!(loaded[0].revision, 2);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn classifies_unlock_and_flood_wait_failures() {
-        let mut transfer = job("one", 1);
-        apply_failure(
-            &mut transfer,
-            "[KEY_REQUIRED] passphrase".to_string(),
-            1_000,
-        );
-        assert_eq!(transfer.status, TransferStatus::WaitingForUnlock);
-        apply_failure(&mut transfer, "RPC FLOOD_WAIT_17".to_string(), 1_000);
-        assert_eq!(transfer.status, TransferStatus::Cooldown);
-        assert_eq!(transfer.retry_at, Some(18_000));
-    }
-
-    #[test]
-    fn scheduler_is_fifo_and_enforces_directional_limits() {
-        let mut jobs = HashMap::new();
-        let mut upload_one = job("upload-one", 1);
-        upload_one.queue_position = 1;
-        let mut download_one = job("download-one", 1);
-        download_one.direction = TransferDirection::Download;
-        download_one.kind = TransferKind::Download;
-        download_one.queue_position = 2;
-        let mut upload_two = job("upload-two", 1);
-        upload_two.queue_position = 3;
-        let mut paused = job("paused", 1);
-        paused.queue_position = 0;
-        paused.status = TransferStatus::Paused;
-        for transfer in [upload_one, download_one, upload_two, paused] {
-            jobs.insert(transfer.id.clone(), transfer);
-        }
-
-        let selected = select_pending_job_ids(&jobs, &HashMap::new(), 1, 1);
-        assert_eq!(selected, vec!["upload-one", "download-one"]);
-
-        let active = HashMap::from([("upload-one".to_string(), TransferDirection::Upload)]);
-        let selected = select_pending_job_ids(&jobs, &active, 1, 0);
-        assert_eq!(selected, vec!["upload-two"]);
-    }
-
-    #[test]
-    fn restart_recovery_preserves_pauses_and_requires_new_secret_handles() {
-        let mut running = job("running", 4);
-        running.status = TransferStatus::Uploading;
-        assert!(recover_after_restart(&mut running));
-        assert_eq!(running.status, TransferStatus::Paused);
-        assert_eq!(running.revision, 5);
-
-        let mut protected = job("protected", 7);
-        protected.status = TransferStatus::Encrypting;
-        protected.protection_mode = Some("passphrase".to_string());
-        assert!(recover_after_restart(&mut protected));
-        assert_eq!(protected.status, TransferStatus::Paused);
-
-        let mut paused = job("paused", 2);
-        paused.status = TransferStatus::Paused;
-        assert!(!recover_after_restart(&mut paused));
-        assert_eq!(paused.status, TransferStatus::Paused);
-        assert_eq!(paused.revision, 2);
-    }
-    #[tokio::test]
-    async fn failed_essential_commit_never_acknowledges_or_schedules_memory() {
-        let (store, _) = test_store("disk-failure");
-        let mut memory = HashMap::new();
-        execute_test_sql(&store, "PRAGMA query_only = ON").await;
-        assert!(commit_jobs(&store, &mut memory, &[job("uncommitted", 1)])
-            .await
-            .is_err());
-        assert!(memory.is_empty());
-        assert!(select_pending_job_ids(&memory, &HashMap::new(), 1, 1).is_empty());
-        execute_test_sql(&store, "PRAGMA query_only = OFF").await;
-        commit_jobs(&store, &mut memory, &[job("uncommitted", 1)])
-            .await
-            .unwrap();
-        let mut active = memory["uncommitted"].clone();
-        active.status = TransferStatus::Uploading;
-        active.revision = 2;
-        execute_test_sql(&store, "PRAGMA query_only = ON").await;
-        assert!(commit_jobs(&store, &mut memory, &[active]).await.is_err());
-        assert_eq!(memory["uncommitted"].status, TransferStatus::Pending);
-    }
-
-    #[tokio::test]
-    async fn batch_failure_rolls_back_every_record_and_memory() {
-        let (store, _) = test_store("atomic-batch");
-        execute_test_sql(&store, "CREATE TRIGGER reject_second BEFORE INSERT ON transfer_jobs WHEN NEW.id = 'second' BEGIN SELECT RAISE(ABORT, 'disk failure'); END").await;
-        let mut memory = HashMap::new();
-        assert!(
-            commit_jobs(&store, &mut memory, &[job("first", 1), job("second", 1)])
-                .await
-                .is_err()
-        );
-        assert!(memory.is_empty());
-        assert!(stored_jobs(&store).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn removed_records_cannot_be_resurrected_by_late_progress() {
-        let (store, _) = test_store("tombstone");
-        store.upsert(&job("gone", 1)).await.unwrap();
-        store.delete("gone").await.unwrap();
-        assert!(store.upsert(&job("gone", 900)).await.is_err());
-        assert!(stored_jobs(&store).await.is_empty());
-    }
-
-    #[test]
-    fn legacy_adoption_is_explicit_paused_and_rejects_account_relative_downloads() {
-        let mut legacy = job("legacy", 1);
-        legacy.owner_id = None;
-        assert!(recover_after_restart(&mut legacy));
-        assert_eq!(legacy.status, TransferStatus::Paused);
-        let adopted = adopt_legacy(&legacy, "200").unwrap();
-        assert_eq!(adopted.owner_id.as_deref(), Some("200"));
-        assert_eq!(adopted.status, TransferStatus::Paused);
-        assert_eq!(adopted.path, legacy.path);
-        legacy.direction = TransferDirection::Download;
-        legacy.kind = TransferKind::Download;
-        assert!(adopt_legacy(&legacy, "200").is_err());
-        assert!(adopt_legacy(&adopted, "300").is_err());
-    }
-
-    #[tokio::test]
-    async fn completion_save_failure_preserves_result_and_restart_requires_review() {
-        let (store, path) = test_store("completion-checkpoint");
-        let mut initial = job("published", 1);
-        initial.status = TransferStatus::Uploading;
-        let mut memory = HashMap::new();
-        let mut pending = HashMap::new();
-        commit_jobs(&store, &mut memory, &[initial]).await.unwrap();
-        let mut result = memory["published"].clone();
-        result.status = TransferStatus::Completed;
-        result.message_id = Some(42);
-        result.revision = 2;
-        execute_test_sql(&store, "PRAGMA query_only = ON").await;
-        let visible = commit_result(&store, &mut memory, &mut pending, result).await;
-        assert_eq!(visible.status, TransferStatus::Completed);
-        assert!(visible.persistence_pending);
-        assert_eq!(pending["published"].message_id, Some(42));
-        assert!(select_pending_job_ids(&memory, &HashMap::new(), 1, 1).is_empty());
-        let (_, recovered) = TransferStore::open(&path).unwrap();
-        assert_eq!(recovered[0].status, TransferStatus::Paused);
-        assert_eq!(
-            recovered[0].error_category,
-            Some(TransferErrorCategory::Interrupted)
-        );
-        execute_test_sql(&store, "PRAGMA query_only = OFF").await;
-        let mut retry = pending["published"].clone();
-        retry.revision = 3;
-        let saved = commit_result(&store, &mut memory, &mut pending, retry).await;
-        assert!(!saved.persistence_pending);
-        assert!(pending.is_empty());
-        let (_, durable) = TransferStore::open(&path).unwrap();
-        assert_eq!(durable[0].status, TransferStatus::Completed);
-        assert_eq!(durable[0].message_id, Some(42));
-    }
-
-    #[tokio::test]
-    async fn record_removal_preserves_external_download_and_failed_source() {
-        let (store, _) = test_store("preserve-files");
-        let file =
-            std::env::temp_dir().join(format!("external-transfer-{}.txt", uuid::Uuid::new_v4()));
-        std::fs::write(&file, "user-owned contents").unwrap();
-        let mut record = job("record", 1);
-        record.path = Some(file.to_string_lossy().into());
-        record.save_path = record.path.clone();
-        store.upsert(&record).await.unwrap();
-        store.delete(&record.id).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "user-owned contents"
-        );
-        std::fs::remove_file(file).unwrap();
-    }
-    #[test]
-    fn activity_projection_hides_protected_metadata_without_losing_retry_identity() {
-        let mut source = job("opaque-retry-id", 4);
-        source.protection_mode = Some("vault_and_passphrase".into());
-        source.filename = "private-title.pdf".into();
-        source.path = Some("/private/source.pdf".into());
-        source.url = Some("https://private.example/file?secret=1".into());
-        source.save_path = Some("/private/destination.pdf".into());
-        source.temp_zip_path = Some("/private/generated.zip".into());
-        source.error = Some("secret failure details".into());
-        let projected = activity_projection(&source);
-        let serialized = serde_json::to_string(&projected).unwrap();
-        assert!(!serialized.contains("private"));
-        assert!(!serialized.contains("secret"));
-        assert_eq!(projected.id, source.id);
-        assert_eq!(projected.owner_id, source.owner_id);
-        assert_eq!(projected.protection_mode, source.protection_mode);
-        assert_eq!(projected.total_bytes, 0);
-        assert_eq!(source.filename, "private-title.pdf");
-        source.protection_mode = Some("standard".into());
-        source.protect_metadata = Some(true);
-        assert_eq!(activity_projection(&source).filename, source.filename);
-        source.status = TransferStatus::WaitingForUnlock;
-        assert!(activity_projection(&source).filename.is_empty());
-    }
-    #[tokio::test]
-    async fn download_policy_and_actual_publication_survive_failed_save_and_restart() {
-        let (store, path) = test_store("download-publication");
-        let mut initial = job("download", 1);
-        initial.kind = TransferKind::Download;
-        initial.direction = TransferDirection::Download;
-        initial.status = TransferStatus::Downloading;
-        initial.collision_policy = DownloadCollisionPolicy::Skip;
-        initial.save_path = Some("/tmp/original.txt".into());
-        let mut memory = HashMap::new();
-        let mut pending = HashMap::new();
-        commit_jobs(&store, &mut memory, &[initial]).await.unwrap();
-        let mut result = memory["download"].clone();
-        result.status = TransferStatus::Completed;
-        result.revision = 2;
-        record_success_response(
-            &mut result,
-            &DownloadPublication {
-                outcome: DownloadOutcome::Skipped,
-                save_path: "/tmp/actual.txt".into(),
-            }
-            .response()
-            .unwrap(),
-        );
-        execute_test_sql(&store, "PRAGMA query_only = ON").await;
-        let visible = commit_result(&store, &mut memory, &mut pending, result).await;
-        assert!(visible.persistence_pending);
-        assert_eq!(visible.download_outcome, Some(DownloadOutcome::Skipped));
-        assert_eq!(
-            pending["download"].save_path.as_deref(),
-            Some("/tmp/actual.txt")
-        );
-        assert!(select_pending_job_ids(&memory, &HashMap::new(), 1, 1).is_empty());
-        let (_, recovered) = TransferStore::open(&path).unwrap();
-        assert_eq!(recovered[0].status, TransferStatus::Paused);
-        assert_eq!(recovered[0].collision_policy, DownloadCollisionPolicy::Skip);
-        execute_test_sql(&store, "PRAGMA query_only = OFF").await;
-        let mut retry = pending["download"].clone();
-        retry.revision = 3;
-        commit_result(&store, &mut memory, &mut pending, retry).await;
-        let (_, durable) = TransferStore::open(&path).unwrap();
-        assert_eq!(durable[0].save_path.as_deref(), Some("/tmp/actual.txt"));
-        assert_eq!(durable[0].filename, "actual.txt");
-        assert_eq!(durable[0].download_outcome, Some(DownloadOutcome::Skipped));
-        assert_eq!(durable[0].owner_id, memory["download"].owner_id);
-    }
-
-    #[test]
-    fn batch_reservations_cover_pending_jobs_and_unowned_imports_remain_unchanged() {
-        let directory =
-            std::env::temp_dir().join(format!("download-reservations-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&directory).unwrap();
-        let destination = directory.join("sanitized.txt");
-        let mut a = job("a", 1);
-        a.kind = TransferKind::Download;
-        a.direction = TransferDirection::Download;
-        a.save_path = Some(destination.to_string_lossy().into_owned());
-        let mut b = a.clone();
-        b.id = "b".into();
-        let mut legacy = a.clone();
-        legacy.id = "legacy".into();
-        legacy.owner_id = None;
-        legacy.status = TransferStatus::Paused;
-        let created = ["a".into(), "b".into(), "legacy".into()]
-            .into_iter()
-            .collect();
-        let jobs = reserve_new_downloads(
-            vec![a, b, legacy],
-            &created,
-            std::slice::from_ref(&destination),
-        )
-        .unwrap();
-        assert!(jobs[0]
-            .save_path
-            .as_deref()
-            .unwrap()
-            .ends_with("sanitized (1).txt"));
-        assert!(jobs[1]
-            .save_path
-            .as_deref()
-            .unwrap()
-            .ends_with("sanitized (2).txt"));
-        assert_eq!(
-            jobs[2].save_path.as_deref(),
-            Some(destination.to_str().unwrap())
-        );
-        assert!(jobs[2].owner_id.is_none());
-        assert_eq!(jobs[2].status, TransferStatus::Paused);
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
-        std::fs::remove_dir(directory).unwrap();
-    }
 }

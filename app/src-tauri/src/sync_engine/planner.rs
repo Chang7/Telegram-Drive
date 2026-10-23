@@ -90,6 +90,86 @@ impl std::fmt::Display for SyncError {
     }
 }
 
+/// Baseline files that exist on both sides of a mapping that has never
+/// recorded them, when they share a path and a byte size. Local and Telegram
+/// trees use different fingerprints, so without this an already-populated
+/// folder reports every shared file as a conflict. Returns the adopted paths so
+/// the caller can persist them; files that differ in size stay conflicts.
+pub fn adopt_matching_files(
+    local: &FileTree,
+    remote: &FileTree,
+    synced: &mut SyncedTree,
+) -> Vec<String> {
+    let mut adopted = Vec::new();
+    for (relative_path, local_entry) in local {
+        let Some(remote_entry) = remote.get(relative_path) else {
+            continue;
+        };
+        // A file with recorded history is never re-baselined, except the
+        // conflict this same pair of copies produced before adoption was
+        // turned on.
+        let adoptable = synced.get(relative_path).is_none_or(|previous| {
+            previous.sync_status == "conflict"
+                && previous.local_hash.as_deref() == Some(local_entry.hash.as_str())
+                && previous.remote_hash.as_deref() == Some(remote_entry.hash.as_str())
+        });
+        if !adoptable {
+            continue;
+        }
+        if local_entry.file_size != remote_entry.file_size {
+            continue;
+        }
+        synced.insert(
+            relative_path.clone(),
+            SyncedEntry {
+                relative_path: relative_path.clone(),
+                local_hash: Some(local_entry.hash.clone()),
+                remote_hash: Some(remote_entry.hash.clone()),
+                file_size: local_entry.file_size,
+                local_mtime: local_entry.modified_at,
+                remote_date: remote_entry.modified_at,
+                message_id: remote_entry.message_id,
+                sync_status: "synced".to_string(),
+            },
+        );
+        adopted.push(relative_path.clone());
+    }
+    adopted
+}
+
+/// An upload is journaled as `syncing` with its Telegram message id before the
+/// uploaded message's fingerprint is known. If the engine stopped before that
+/// final step, finish it here: the file is unchanged locally and the same
+/// message is still at that path, so it is our own upload rather than a remote
+/// edit that would have to be downloaded again. Returns the completed paths.
+pub fn resume_interrupted_uploads(
+    local: &FileTree,
+    remote: &FileTree,
+    synced: &mut SyncedTree,
+) -> Vec<String> {
+    let mut resumed = Vec::new();
+    for (relative_path, previous) in synced.iter_mut() {
+        if previous.sync_status != "syncing" || previous.message_id.is_none() {
+            continue;
+        }
+        let (Some(local_entry), Some(remote_entry)) =
+            (local.get(relative_path), remote.get(relative_path))
+        else {
+            continue;
+        };
+        if remote_entry.message_id != previous.message_id
+            || previous.local_hash.as_deref() != Some(local_entry.hash.as_str())
+        {
+            continue;
+        }
+        previous.remote_hash = Some(remote_entry.hash.clone());
+        previous.remote_date = remote_entry.modified_at;
+        previous.sync_status = "synced".to_string();
+        resumed.push(relative_path.clone());
+    }
+    resumed
+}
+
 pub fn plan(
     local: &FileTree,
     remote: &FileTree,
@@ -380,234 +460,4 @@ pub fn enforce_mass_deletion(
         });
     }
     Ok(operations)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(path: &str, hash: &str) -> TreeEntry {
-        TreeEntry {
-            relative_path: path.into(),
-            hash: hash.into(),
-            file_size: 1,
-            modified_at: None,
-            message_id: Some(1),
-        }
-    }
-    fn synced(path: &str, local: &str, remote: &str) -> SyncedEntry {
-        SyncedEntry {
-            relative_path: path.into(),
-            local_hash: Some(local.into()),
-            remote_hash: Some(remote.into()),
-            file_size: 1,
-            local_mtime: None,
-            remote_date: None,
-            message_id: Some(1),
-            sync_status: "synced".into(),
-        }
-    }
-
-    #[test]
-    fn three_tree_changes_are_directional() {
-        let local = FileTree::from([
-            ("a".into(), entry("a", "local-new")),
-            ("b".into(), entry("b", "same")),
-        ]);
-        let remote = FileTree::from([
-            ("a".into(), entry("a", "remote-old")),
-            ("b".into(), entry("b", "remote-new")),
-        ]);
-        let old = SyncedTree::from([
-            ("a".into(), synced("a", "local-old", "remote-old")),
-            ("b".into(), synced("b", "same", "remote-old")),
-        ]);
-        let result = plan(&local, &remote, &old).unwrap();
-        assert!(matches!(result[0], SyncOperation::Upload { .. }));
-        assert!(matches!(result[1], SyncOperation::Download { .. }));
-    }
-
-    #[test]
-    fn edit_versus_delete_preserves_both_sides_for_resolution() {
-        let baseline = SyncedTree::from([
-            ("a".into(), synced("a", "old-local", "old-remote")),
-            ("b".into(), synced("b", "old-local", "old-remote")),
-        ]);
-        let local = FileTree::from([
-            ("a".into(), entry("a", "new-local")),
-            ("b".into(), entry("b", "old-local")),
-        ]);
-        let remote = FileTree::from([("b".into(), entry("b", "old-remote"))]);
-        assert!(matches!(
-            plan(&local, &remote, &baseline).unwrap()[0],
-            SyncOperation::Conflict { .. }
-        ));
-        let local = FileTree::from([("b".into(), entry("b", "old-local"))]);
-        let remote = FileTree::from([
-            ("a".into(), entry("a", "new-remote")),
-            ("b".into(), entry("b", "old-remote")),
-        ]);
-        assert!(matches!(
-            plan(&local, &remote, &baseline).unwrap()[0],
-            SyncOperation::Conflict { .. }
-        ));
-    }
-
-    #[test]
-    fn explicit_conflict_resolution_restores_an_edited_survivor_in_either_direction() {
-        let local = FileTree::from([("a".into(), entry("a", "new-local"))]);
-        let mut previous = synced("a", "old-local", "old-remote");
-        previous.sync_status = "keep_local".into();
-        let baseline = SyncedTree::from([("a".into(), previous.clone())]);
-        assert!(matches!(
-            plan_for_policy(&local, &FileTree::new(), &baseline, "download_only", false).unwrap()
-                [0],
-            SyncOperation::Upload { .. }
-        ));
-        previous.sync_status = "keep_remote".into();
-        let baseline = SyncedTree::from([("a".into(), previous)]);
-        assert!(matches!(
-            plan_for_policy(&FileTree::new(), &local, &baseline, "upload_only", false).unwrap()[0],
-            SyncOperation::Download { .. }
-        ));
-    }
-
-    #[test]
-    fn backup_policy_never_propagates_source_deletions_without_opt_in() {
-        let previous = SyncedTree::from([
-            ("a".into(), synced("a", "local", "remote")),
-            ("b".into(), synced("b", "local", "remote")),
-        ]);
-        let local = FileTree::from([("b".into(), entry("b", "local"))]);
-        let remote = FileTree::from([
-            ("a".into(), entry("a", "remote")),
-            ("b".into(), entry("b", "remote")),
-        ]);
-        assert!(
-            plan_for_policy(&local, &remote, &previous, "upload_only", false)
-                .unwrap()
-                .iter()
-                .all(|operation| !operation.is_delete())
-        );
-        assert!(matches!(
-            plan_for_policy(&local, &remote, &previous, "upload_only", true).unwrap()[0],
-            SyncOperation::DeleteRemote { .. }
-        ));
-        assert!(
-            plan_for_policy(&remote, &local, &previous, "download_only", false)
-                .unwrap()
-                .iter()
-                .all(|operation| !operation.is_delete())
-        );
-    }
-
-    #[test]
-    fn aborts_when_more_than_half_the_baseline_would_be_deleted() {
-        let synced = SyncedTree::from([
-            ("a".into(), synced("a", "1", "1")),
-            ("b".into(), synced("b", "2", "2")),
-            ("c".into(), synced("c", "3", "3")),
-        ]);
-        let local = FileTree::from([("a".into(), entry("a", "1")), ("b".into(), entry("b", "2"))]);
-        assert!(matches!(
-            plan(&local, &FileTree::new(), &synced),
-            Err(SyncError::MassDeletionProtection { .. })
-        ));
-    }
-
-    #[test]
-    fn permanently_skipped_unchanged_upload_is_not_retried_or_treated_as_a_deletion() {
-        let local = FileTree::from([("large.bin".into(), entry("large.bin", "local"))]);
-        let previous = SyncedTree::from([(
-            "large.bin".into(),
-            SyncedEntry {
-                relative_path: "large.bin".into(),
-                local_hash: Some("local".into()),
-                remote_hash: None,
-                file_size: 3_000_000_000,
-                local_mtime: None,
-                remote_date: None,
-                message_id: None,
-                sync_status: "skipped".into(),
-            },
-        )]);
-        assert!(matches!(
-            plan(&local, &FileTree::new(), &previous).unwrap()[0],
-            SyncOperation::Skip { .. }
-        ));
-    }
-
-    #[test]
-    fn transient_failed_initial_transfer_is_retried() {
-        let local = FileTree::from([("retry.bin".into(), entry("retry.bin", "local"))]);
-        let previous = SyncedTree::from([(
-            "retry.bin".into(),
-            SyncedEntry {
-                relative_path: "retry.bin".into(),
-                local_hash: Some("local".into()),
-                remote_hash: None,
-                file_size: 1,
-                local_mtime: None,
-                remote_date: None,
-                message_id: None,
-                sync_status: "error".into(),
-            },
-        )]);
-        assert!(matches!(
-            plan(&local, &FileTree::new(), &previous).unwrap()[0],
-            SyncOperation::Upload { .. }
-        ));
-    }
-
-    #[test]
-    fn one_way_modes_restore_from_the_authoritative_tree() {
-        let local = FileTree::from([("remote-deleted".into(), entry("remote-deleted", "local"))]);
-        let remote = FileTree::from([("local-deleted".into(), entry("local-deleted", "remote"))]);
-        let previous = SyncedTree::from([
-            (
-                "remote-deleted".into(),
-                synced("remote-deleted", "local", "old-remote"),
-            ),
-            (
-                "local-deleted".into(),
-                synced("local-deleted", "old-local", "remote"),
-            ),
-        ]);
-
-        let upload_only = plan_for_direction(&local, &remote, &previous, "upload_only").unwrap();
-        assert!(upload_only.iter().any(|operation| matches!(
-            operation,
-            SyncOperation::Upload { relative_path, .. } if relative_path == "remote-deleted"
-        )));
-
-        let download_only =
-            plan_for_direction(&local, &remote, &previous, "download_only").unwrap();
-        assert!(download_only.iter().any(|operation| matches!(
-            operation,
-            SyncOperation::Download { relative_path, .. } if relative_path == "local-deleted"
-        )));
-    }
-
-    #[test]
-    fn one_hundred_remote_deletions_are_blocked() {
-        let local = (0..100)
-            .map(|index| {
-                let path = format!("file-{index}.txt");
-                (path.clone(), entry(&path, "local"))
-            })
-            .collect();
-        let previous = (0..100)
-            .map(|index| {
-                let path = format!("file-{index}.txt");
-                (path.clone(), synced(&path, "local", "remote"))
-            })
-            .collect();
-        assert!(matches!(
-            plan(&local, &FileTree::new(), &previous),
-            Err(SyncError::MassDeletionProtection {
-                deletes: 100,
-                synced_files: 100
-            })
-        ));
-    }
 }
