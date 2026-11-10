@@ -4,13 +4,8 @@ name: Chang7 upstream sync
 # restricted to the managed repositories.
 # A missing/underprivileged token is a failure, never a successful sync.
 on:
-  schedule:
-    - cron: '23 */6 * * *'
+  # Manual upstream review only. Local fork changes must never be overwritten automatically.
   workflow_dispatch:
-  push:
-    branches: ['main']
-    paths:
-      - '.github/workflows/chang7-upstream-sync.yml'
 permissions:
   contents: write
 concurrency:
