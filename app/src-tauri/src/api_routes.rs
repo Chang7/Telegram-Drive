@@ -143,6 +143,7 @@ fn catalog_error(error: CatalogError) -> HttpResponse {
 
 /// The account this request acts for. Every endpoint checks it again before
 /// answering, so a response never crosses an account switch.
+#[expect(clippy::result_large_err, reason = "Preserve existing API error response and exact HTTP status/body semantics")]
 fn api_account(root: &std::path::Path) -> Result<AccountGuard, HttpResponse> {
     AccountGuard::open(root, None).map_err(|error| json_error("ACCOUNT_UNAVAILABLE", &error, 503))
 }
@@ -160,6 +161,7 @@ async fn api_session(
 
 /// File identifiers are Telegram message identifiers: positive and 32-bit.
 /// Anything else is rejected rather than truncated to a different file.
+#[expect(clippy::result_large_err, reason = "Preserve existing API error response and exact HTTP status/body semantics")]
 fn message_id(value: i64) -> Result<i32, HttpResponse> {
     i32::try_from(value)
         .ok()
@@ -175,6 +177,7 @@ fn message_id(value: i64) -> Result<i32, HttpResponse> {
 
 /// `folder_id` as a query gives it: absent means every folder; an empty
 /// value, `null`, `none` or `home` means Saved Messages.
+#[expect(clippy::result_large_err, reason = "Preserve existing API error response and exact HTTP status/body semantics")]
 fn folder_scope(value: Option<&str>) -> Result<Option<Option<i64>>, HttpResponse> {
     match value.map(str::trim) {
         None => Ok(None),
@@ -189,6 +192,7 @@ fn folder_scope(value: Option<&str>) -> Result<Option<Option<i64>>, HttpResponse
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Preserve existing API error response and exact HTTP status/body semantics")]
 fn time_bound(value: Option<&str>, name: &str) -> Result<Option<i64>, HttpResponse> {
     match value {
         None => Ok(None),
@@ -373,6 +377,7 @@ fn spawn_cache_cleanup(
 }
 
 /// Validate X-API-Key header against stored hash
+#[expect(clippy::result_large_err, reason = "Preserve existing API error response and exact HTTP status/body semantics")]
 fn check_auth(req: &HttpRequest, api_state: &web::Data<ApiState>) -> Result<(), HttpResponse> {
     let key_hash = match &api_state.key_hash {
         Some(h) => h,
